@@ -13,6 +13,54 @@ from datetime import datetime
 st.set_page_config(page_title="デュエマ イベント運営アプリ", layout="wide")
 
 # ==========================================
+# 🎨 ボタンを大きく・見やすくするカスタムデザイン（CSS）
+# ==========================================
+st.markdown(
+    """
+    <style>
+    /* 通常のボタンを大きく押しやすくする */
+    div.stButton > button {
+        min-height: 3.4rem;
+        font-size: 1.15rem !important;
+        font-weight: bold !important;
+        border-radius: 10px !important;
+    }
+    /* メインボタン（次のマッチングに向かう等）はさらに特大にする */
+    div.stButton > button[kind="primary"] {
+        min-height: 4.5rem;
+        font-size: 1.4rem !important;
+        font-weight: 900 !important;
+        border-radius: 12px !important;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+    }
+    /* 卓番号と対戦相手の特大表示カード */
+    .match-card {
+        background-color: #fff8e1;
+        border: 4px solid #ff6f00;
+        border-radius: 16px;
+        padding: 20px;
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    .table-number {
+        font-size: 3.2rem;
+        font-weight: 900;
+        color: #d84315;
+        line-height: 1.2;
+        margin: 10px 0;
+    }
+    .opponent-name {
+        font-size: 2.0rem;
+        font-weight: 800;
+        color: #1a237e;
+        margin: 12px 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# ==========================================
 # 🛡️ パソコンで動かしている時だけスリープ防止を作動
 # ==========================================
 def prevent_sleep():
@@ -109,6 +157,15 @@ def normalize_event_data(d):
     if "lottery_winners" not in d:
         d["lottery_winners"] = []
 
+    # 古い抽選データ（文字列のみ）を「誰に何が当たったか」の辞書形式に自動変換
+    normalized_winners = []
+    for item in d["lottery_winners"]:
+        if isinstance(item, str):
+            normalized_winners.append({"pid": item, "prize": "ランダム賞", "time": ""})
+        elif isinstance(item, dict):
+            normalized_winners.append(item)
+    d["lottery_winners"] = normalized_winners
+
     for m in d.get("matches", []):
         if "players" not in m:
             m["players"] = [m.get("p1"), m.get("p2")]
@@ -121,6 +178,12 @@ def normalize_event_data(d):
             p["survey_done"] = False
         if "pass_given" not in p:
             p["pass_given"] = False
+        if "opponents" not in p:
+            p["opponents"] = []
+        if "last_opponents" not in p:
+            p["last_opponents"] = []
+        if "match_count" not in p:
+            p["match_count"] = p.get("wins", 0) + p.get("losses", 0)
     return d
 
 def load_data():
@@ -140,7 +203,7 @@ def save_data(d):
 data = load_data()
 refresh_sec = data.get("refresh_sec", 30)
 
-# --- 📌 自分の名前（ID）をスマホのURLに記憶・固定する機能 ---
+# --- 📌 自分の名前（ID）や現在開いている画面をURLに記憶する機能 ---
 def get_pinned_pid():
     pid = st.query_params.get("pid", None)
     if pid and pid in data["players"]:
@@ -151,7 +214,11 @@ def set_pinned_pid(pid):
     if pid:
         st.query_params["pid"] = pid
     else:
-        st.query_params.clear()
+        if "pid" in st.query_params:
+            del st.query_params["pid"]
+
+def get_winner_prizes(pid):
+    return [w.get("prize", "景品") for w in data["lottery_winners"] if w.get("pid") == pid]
 
 # --- 経過時間を計算して「🆕新着」かどうか判定する関数 ---
 def get_match_age_info(m):
@@ -166,7 +233,7 @@ def get_match_age_info(m):
     except Exception:
         return False, "--:--", "-"
 
-# --- 2. マッチング機能 ---
+# --- 2. マッチング機能（同じ人と連続で当たらない制御つき） ---
 def auto_match(division_name, force=False):
     waiting_ids = [
         pid for pid, p in data["players"].items()
@@ -179,7 +246,7 @@ def auto_match(division_name, force=False):
     new_match_ids = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ★ デュエパ部門（4人マッチング・一部重複OK）
+    # ★ デュエパ部門（4人マッチング・直前と全く同じメンバーや連続同卓を回避）
     if "デュエパ" in division_name:
         if len(waiting_ids) < 4:
             return []
@@ -188,30 +255,43 @@ def auto_match(division_name, force=False):
         past_groups = [set(m.get("players", [])) for m in data["matches"] if m["division"] == division_name]
         
         while len(waiting_ids) >= 4 and free_tables:
-            group = waiting_ids[:4]
-            if set(group) in past_groups and len(waiting_ids) > 4:
-                for _ in range(5):
+            best_group = waiting_ids[:4]
+            if len(waiting_ids) > 4:
+                # 直前の対戦相手との重複が最も少ない組み合わせを探す
+                best_score = 999
+                for _ in range(15):
                     random.shuffle(waiting_ids)
-                    group = waiting_ids[:4]
-                    if set(group) not in past_groups:
+                    candidate = waiting_ids[:4]
+                    if set(candidate) in past_groups:
+                        continue
+                    # 直前に当たった人が何人混ざっているかカウント
+                    consec_overlap = sum(
+                        1 for pid in candidate
+                        for other in candidate
+                        if other != pid and other in data["players"][pid].get("last_opponents", [])
+                    )
+                    if consec_overlap < best_score:
+                        best_score = consec_overlap
+                        best_group = list(candidate)
+                    if best_score == 0:
                         break
                         
-            for pid in group:
+            for pid in best_group:
                 waiting_ids.remove(pid)
                 
             table_num = free_tables.pop(0)
-            for pid in group:
+            for pid in best_group:
                 data["players"][pid]["status"] = "対戦中"
-                for other_pid in group:
-                    if other_pid != pid:
-                        data["players"][pid]["opponents"].append(other_pid)
+                others = [o for o in best_group if o != pid]
+                data["players"][pid]["opponents"].extend(others)
+                data["players"][pid]["last_opponents"] = others
                         
             match_id = f"M4_{datetime.now().strftime('%H%M%S')}_{table_num}"
             data["matches"].append({
                 "match_id": match_id,
                 "division": division_name,
                 "table": table_num,
-                "players": group,
+                "players": best_group,
                 "status": "対戦中",
                 "created_at": now_str
             })
@@ -222,14 +302,13 @@ def auto_match(division_name, force=False):
             save_data(data)
         return new_match_ids
 
-    # ★ 通常部門（2人マッチング）
+    # ★ 通常部門（2人マッチング・過去未対戦を最優先＆直前の相手とは連続で当たらない）
     else:
         required_wait = 2 if force else data["min_wait_players"]
         if len(waiting_ids) < required_wait:
             return []
 
         random.shuffle(waiting_ids)
-        waiting_ids.sort(key=lambda pid: data["players"][pid]["wins"], reverse=True)
 
         used_players = set()
 
@@ -237,18 +316,23 @@ def auto_match(division_name, force=False):
             if p1_id in used_players or not free_tables:
                 continue
             p1 = data["players"][p1_id]
+            p1_last = p1.get("last_opponents", [])
             
+            # ① まずは「過去に一度も当たっていない（当然直前でもない）」相手を探す
             partner_id = None
             for p2_id in waiting_ids[i+1:]:
                 if p2_id in used_players:
                     continue
-                if p2_id not in p1["opponents"]:
+                if p2_id not in p1["opponents"] and p2_id not in p1_last:
                     partner_id = p2_id
                     break
             
-            if not partner_id and force:
+            # ② 全員と一巡して未対戦相手がいない場合でも、「直前に戦った相手（連続対戦）」だけは避けて組む
+            if not partner_id:
                 for p2_id in waiting_ids[i+1:]:
-                    if p2_id not in used_players:
+                    if p2_id in used_players:
+                        continue
+                    if p2_id not in p1_last:
                         partner_id = p2_id
                         break
             
@@ -261,6 +345,8 @@ def auto_match(division_name, force=False):
                 data["players"][partner_id]["status"] = "対戦中"
                 data["players"][p1_id]["opponents"].append(partner_id)
                 data["players"][partner_id]["opponents"].append(p1_id)
+                data["players"][p1_id]["last_opponents"] = [partner_id]
+                data["players"][partner_id]["last_opponents"] = [p1_id]
                 
                 match_id = f"M2_{datetime.now().strftime('%H%M%S')}_{table_num}"
                 data["matches"].append({
@@ -288,9 +374,10 @@ def auto_match_all_divisions(force=False):
         save_data(data)
     return all_new_ids
 
+# 画面読み込み時に自動マッチング判定を実行
 auto_match_all_divisions(force=False)
 
-# --- 3. サイドバーメニュー ＆ 自動更新設定 ---
+# --- 3. サイドバーメニュー（更新してもスタッフ画面から飛ばないようにURLで画面を維持） ---
 st.sidebar.title("メニュー切り替え")
 st.sidebar.caption(f"現在開催中: **{current_event}**")
 
@@ -301,30 +388,26 @@ if pinned_pid:
 if SLEEP_PREVENTED:
     st.sidebar.success("🛡️ PCスリープ防止：作動中")
 
-mode = st.sidebar.radio("画面を選んでください", ["📱 プレイヤー画面", "💻 スタッフ管理画面", "📝 アンケート回答"])
+mode_list = ["📱 プレイヤー画面", "💻 スタッフ管理画面", "📝 アンケート回答"]
+mode_codes = {"player": 0, "admin": 1, "survey": 2}
+code_by_mode = {"📱 プレイヤー画面": "player", "💻 スタッフ管理画面": "admin", "📝 アンケート回答": "survey"}
+
+current_mode_code = st.query_params.get("mode", "player")
+default_mode_idx = mode_codes.get(current_mode_code, 0)
+
+mode = st.sidebar.radio("画面を選んでください", mode_list, index=default_mode_idx)
+
+# 選んだ画面をURLに記憶（更新ボタンを押してもプレイヤー画面に戻らないようにする）
+selected_code = code_by_mode[mode]
+if st.query_params.get("mode") != selected_code:
+    st.query_params["mode"] = selected_code
 
 st.sidebar.divider()
-auto_refresh = st.sidebar.checkbox(f"⏱️ {refresh_sec}秒ごとに自動更新＆マッチング", value=True)
-if auto_refresh and mode != "📝 アンケート回答":
-    st.sidebar.caption(f"※{refresh_sec}秒ごとに自動で画面を更新します（固定した名前は維持されます）。")
-    components.html(
-        f"""
-        <script>
-            setTimeout(function(){{
-                window.parent.location.reload();
-            }}, {refresh_sec * 1000});
-        </script>
-        """,
-        height=0
-    )
-elif mode == "📝 アンケート回答":
-    st.sidebar.caption("※アンケート入力中は文字が消えないよう自動更新を一時停止しています。")
-
-if st.sidebar.button("🔄 今すぐ画面を最新状態に更新"):
+if st.sidebar.button("🔄 画面を最新状態に更新"):
     st.rerun()
 
 # ==========================================
-# 📱 プレイヤー画面（自分の名前固定機能つき）
+# 📱 プレイヤー画面（スマホ・PC共通）
 # ==========================================
 if mode == "📱 プレイヤー画面":
     st.title("🐉 デュエマ イベント プレイヤー画面")
@@ -355,7 +438,9 @@ if mode == "📱 プレイヤー画面":
                         "status": "待機中",
                         "wins": 0,
                         "losses": 0,
+                        "match_count": 0,
                         "opponents": [],
+                        "last_opponents": [],
                         "survey_done": False,
                         "pass_given": False
                     }
@@ -389,22 +474,25 @@ if mode == "📱 プレイヤー画面":
         with col_title:
             st.success(f"📌 **あなたの専用画面： {selected_pid} : {p_info['name']} さん**")
         with col_unpin:
-            if st.button("🔄 別の人に切り替える"):
+            if st.button("🔄 別の人に切替"):
                 set_pinned_pid(None)
                 st.rerun()
 
         survey_badge = "✅回答済" if p_info.get("survey_done") else "❌未回答"
         pass_badge = "🎫受取済" if p_info.get("pass_given") else "未受取"
         
-        st.write(f"**DMPID:** {p_info.get('dmp_id', '未登録')} ｜ **現在の部門:** {p_info['division']} ｜ **状態:** {p_info['status']} ｜ **戦績:** {p_info['wins']}勝 {p_info['losses']}敗")
+        st.write(f"**DMPID:** {p_info.get('dmp_id', '未登録')} ｜ **現在の部門:** {p_info['division']} ｜ **状態:** {p_info['status']} ｜ **本日の対戦数:** {p_info.get('match_count', 0)}戦")
         st.caption(f"アンケート状態: **{survey_badge}** ｜ 参加証: **{pass_badge}**")
 
-        if selected_pid in data["lottery_winners"]:
+        # 当選確認（何が当たったかも表示）
+        my_prizes = get_winner_prizes(selected_pid)
+        if my_prizes:
             st.balloons()
-            st.success("🎉 おめでとうございます！ランダム賞（抽選）に当選しました！スタッフ席へお越しください！")
+            st.success(f"🎉 **おめでとうございます！抽選に当選しました！**\n\n🎁 **当選景品： {' ／ '.join(my_prizes)}**\n\nスタッフ席へお越しください！")
 
         st.divider()
 
+        # 対戦中の場合：卓番と対戦相手の名前を特大表示 ＆「次のマッチングに向かう」ボタン（片方が押したら即ロック）
         if p_info["status"] == "対戦中":
             current_match = next((m for m in data["matches"] if m["status"] == "対戦中" and selected_pid in m.get("players", [])), None)
             if current_match:
@@ -412,132 +500,140 @@ if mode == "📱 プレイヤー画面":
                 other_pids = [pid for pid in m_players if pid != selected_pid]
                 other_names = [data["players"].get(pid, {}).get("name", "不明") for pid in other_pids]
                 is_new, time_str, ago_str = get_match_age_info(current_match)
-                new_label = "🆕【新着マッチング！】 " if is_new else ""
+                new_badge_html = "<div style='color:#d84315; font-weight:bold; font-size:1.2rem;'>🆕 新着マッチング！</div>" if is_new else ""
                 
-                st.info(f"🔥 **{new_label}【対戦案内】 第 {current_match['table']} 番卓** へ移動してください！（開始: {time_str}）\n\n**対戦相手:** {' さん / '.join(other_names)} さん（{current_match['division']}部門）")
+                # 卓番号と対戦相手の名前を特大表示
+                st.markdown(
+                    f"""
+                    <div class="match-card">
+                        {new_badge_html}
+                        <div style="font-size:1.2rem; font-weight:bold; color:#555;">【{current_match['division']}部門】 案内テーブル（開始 {time_str}）</div>
+                        <div class="table-number">第 {current_match['table']} 番卓</div>
+                        <div style="font-size:1.1rem; color:#333;">対戦相手</div>
+                        <div class="opponent-name">{' さん ／ '.join(other_names)} さん</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
                 
-                if len(m_players) > 2:
-                    st.write("### 👇 対戦が終わったら代表者1名が結果ボタンを押してください")
-                    col1, col2 = st.columns(2)
-                    if col1.button("👑 自分が勝った（1位）", use_container_width=True, type="primary"):
-                        current_match["status"] = "終了"
+                st.write("### 👇 対戦が終わったら下のボタンを押してください（対戦相手のどちらか1人が押せば全員次に進みます）")
+                if st.button("🚀 対戦終了！次のマッチングに向かう", use_container_width=True, type="primary"):
+                    # 二重押し防止チェック：押した瞬間に最新データを読み込み直し、相手がすでに押していないか確認
+                    latest_data = load_data()
+                    latest_match = next((m for m in latest_data["matches"] if m["match_id"] == current_match["match_id"]), None)
+                    
+                    if latest_match and latest_match["status"] == "対戦中":
+                        latest_match["status"] = "終了"
                         for pid in m_players:
-                            if pid in data["players"]:
-                                data["players"][pid]["status"] = "待機中"
-                                if pid == selected_pid:
-                                    data["players"][pid]["wins"] += 1
-                                else:
-                                    data["players"][pid]["losses"] += 1
-                        save_data(data)
+                            if pid in latest_data["players"]:
+                                latest_data["players"][pid]["status"] = "待機中"
+                                latest_data["players"][pid]["match_count"] = latest_data["players"][pid].get("match_count", 0) + 1
+                        save_data(latest_data)
+                        data = latest_data
                         auto_match(current_match["division"], force=False)
-                        st.success("対戦終了！4人全員が次のマッチング待機中に戻りました。")
+                        st.success("お疲れ様でした！対戦を終了し、次のマッチング待機に入りました！")
                         st.rerun()
-                        
-                    if col2.button("🤝 対戦終了（勝敗をつけずに終了）", use_container_width=True):
-                        current_match["status"] = "終了"
-                        for pid in m_players:
-                            if pid in data["players"]:
-                                data["players"][pid]["status"] = "待機中"
-                        save_data(data)
-                        auto_match(current_match["division"], force=False)
-                        st.info("対戦終了！4人全員が次のマッチング待機中に戻りました。")
+                    else:
+                        st.info("すでに対戦相手が終了ボタンを押したため、次のマッチング待機に入っています！")
                         st.rerun()
+            else:
+                # 相手が先にボタンを押して卓が終了になっていた場合、待機中へ自動同期
+                data["players"][selected_pid]["status"] = "待機中"
+                save_data(data)
+                st.rerun()
 
-                else:
-                    opp_id = other_pids[0] if other_pids else None
-                    st.write("### 👇 対戦が終わったら結果を報告してください")
-                    col1, col2 = st.columns(2)
-                    if col1.button("⭕ 自分の勝ち", use_container_width=True, type="primary"):
-                        current_match["status"] = "終了"
-                        data["players"][selected_pid]["wins"] += 1
-                        if opp_id and opp_id in data["players"]:
-                            data["players"][opp_id]["losses"] += 1
-                            data["players"][opp_id]["status"] = "待機中"
-                        data["players"][selected_pid]["status"] = "待機中"
-                        save_data(data)
-                        auto_match(current_match["division"], force=False)
-                        st.success("勝利報告を受け付けました！次のマッチングまで待機中になります。")
-                        st.rerun()
-                        
-                    if col2.button("❌ 自分の負け", use_container_width=True):
-                        current_match["status"] = "終了"
-                        if opp_id and opp_id in data["players"]:
-                            data["players"][opp_id]["wins"] += 1
-                            data["players"][opp_id]["status"] = "待機中"
-                        data["players"][selected_pid]["losses"] += 1
-                        data["players"][selected_pid]["status"] = "待機中"
-                        save_data(data)
-                        auto_match(current_match["division"], force=False)
-                        st.info("結果報告を受け付けました！次のマッチングまで待機中になります。")
-                        st.rerun()
-
+        # 待機中 または 休憩中の場合
         else:
             if p_info["status"] == "待機中":
                 if "デュエパ" in p_info["division"]:
-                    st.warning(f"⏳ 現在、デュエパ部門の対戦メンバー（4人）が揃うのを待っています（{refresh_sec}秒ごとに自動更新されます）。")
+                    st.warning("⏳ 現在、デュエパ部門の対戦メンバー（4人）が揃うのを待っています。マッチングが成立したら上の「🔄 画面を最新状態に更新」を押して卓番を確認してください。")
                 else:
-                    st.warning(f"⏳ 現在、次の対戦相手を探しています（{refresh_sec}秒ごとに自動更新されます）。")
+                    st.warning("⏳ 現在、次の対戦相手を探しています（待機中）。しばらくお待ちいただき、「🔄 画面を最新状態に更新」を押してください。")
             else:
-                st.info("☕ 現在「休憩中」です。マッチングを再開するには下の「⚔️ 待機中に戻る」を押してください。")
+                st.error("☕ 現在「休憩中（マッチング停止中）」です。対戦を再開するには下の「⚔️ 待機中に戻る（マッチング再開）」を押してください。")
             
-            st.subheader("🔄 部門の変更・休憩")
+            st.subheader("🔄 部門の変更")
             div_idx = data["divisions"].index(p_info["division"]) if p_info["division"] in data["divisions"] else 0
             new_div = st.selectbox("変更先の部門を選択", data["divisions"], index=div_idx)
-            if st.button("部門を変更する"):
+            if st.button("部門を変更する", use_container_width=True):
                 data["players"][selected_pid]["division"] = new_div
                 save_data(data)
                 auto_match(new_div, force=False)
                 st.success(f"部門を「{new_div}」に変更しました！")
                 st.rerun()
 
-            if p_info["status"] == "待機中":
-                if st.button("☕ 一時休憩する（マッチングを止める）"):
-                    data["players"][selected_pid]["status"] = "休憩中"
-                    save_data(data)
-                    st.rerun()
-            elif p_info["status"] == "休憩中":
-                if st.button("⚔️ 待機中に戻る（マッチング再開）", type="primary"):
+            # 休憩中なら大きく復帰ボタンを表示、待機中なら小さく折りたたんで注意書きを表示
+            if p_info["status"] == "休憩中":
+                st.subheader("⚔️ マッチングへの復帰")
+                if st.button("⚔️ 待機中に戻る（マッチング再開）", type="primary", use_container_width=True):
                     data["players"][selected_pid]["status"] = "待機中"
                     save_data(data)
                     auto_match(p_info["division"], force=False)
                     st.rerun()
+            elif p_info["status"] == "待機中":
+                st.write("")
+                with st.expander("☕ 一時休憩（マッチング停止）はこちら ※小さく収納しています"):
+                    st.warning("⚠️ **【注意】** 休憩中に切り替えると、あなたが「待機中に戻る」ボタンを押すまで**次の対戦マッチングから除外**されます。本当に休憩しますか？")
+                    confirm_break = st.checkbox("注意を確認しました（休憩中に切り替える）")
+                    if confirm_break:
+                        if st.button("☕ 休憩中に切り替える"):
+                            data["players"][selected_pid]["status"] = "休憩中"
+                            save_data(data)
+                            st.rerun()
 
 # ==========================================
-# 💻 スタッフ管理画面（バックアップ保存・復元機能つき）
+# 💻 スタッフ管理画面（自動マッチング維持 ＆ 更新しても画面維持）
 # ==========================================
 elif mode == "💻 スタッフ管理画面":
     st.title("💻 イベント運営・スタッフ管理画面")
 
+    # URLパラメータ（auth=1）と連動して、ブラウザ更新してもログイン状態を維持する
     if "is_admin" not in st.session_state:
-        st.session_state.is_admin = False
+        st.session_state.is_admin = (st.query_params.get("auth") == "1")
 
     if not st.session_state.is_admin:
         st.warning("🔒 この画面はスタッフ専用です。操作するにはパスワードを入力してください。")
         pwd_input = st.text_input("スタッフ用パスワード", type="password")
-        if st.button("ログイン"):
+        if st.button("ログイン", type="primary"):
             if pwd_input == config.get("admin_password", "1234"):
                 st.session_state.is_admin = True
+                st.query_params["mode"] = "admin"
+                st.query_params["auth"] = "1"
                 st.success("認証に成功しました！")
                 st.rerun()
             else:
                 st.error("パスワードが違います。")
     else:
+        # スタッフ画面を開いている間だけ、設定秒数ごとに自動更新＆自動マッチングを裏で作動させる
+        components.html(
+            f"""
+            <script>
+                setTimeout(function(){{
+                    window.parent.location.reload();
+                }}, {refresh_sec * 1000});
+            </script>
+            """,
+            height=0
+        )
+
         if st.sidebar.button("🔒 スタッフ画面をロック（ログアウト）"):
             st.session_state.is_admin = False
+            if "auth" in st.query_params:
+                del st.query_params["auth"]
             st.rerun()
 
-        st.info(f"📁 現在操作中のイベント: **{current_event}** （⏱️現在 **{refresh_sec}秒** ごとに自動で待機者のマッチングが実行されます）")
+        st.info(f"📁 現在操作中のイベント: **{current_event}** （⏱️スタッフ画面では **{refresh_sec}秒** ごとに自動で待機者のマッチングが実行されます）")
 
         tab_status, tab_csv, tab_manual, tab_lottery, tab_qr, tab_settings = st.tabs([
             "📊 卓状況・強制マッチング",
             "🎫 参加証・CSV・バックアップ",
             "🤝 手動ペアリング・参加者削除",
-            "🎁 抽選（1〜18人）",
+            "🎁 抽選（景品選択つき）",
             "📱 参加者用QRコード",
             "⚙️ イベント・会場設定"
         ])
 
-        # 1. リアルタイム卓状況 ＆ 強制マッチング ＆ スタッフ代理結果入力
+        # 1. リアルタイム卓状況 ＆ 強制マッチング ＆ スタッフ代理終了
         with tab_status:
             st.subheader("⚡ スタッフ操作：設定人数に関係なく今すぐマッチングを生成")
             if st.button("🚀 全部門の待機者で今すぐ強制マッチングを一括実行する（設定人数を無視）", type="primary", use_container_width=True):
@@ -564,7 +660,7 @@ elif mode == "💻 スタッフ管理画面":
                     st.rerun()
 
             st.divider()
-            st.subheader("現在の対戦中卓リスト ＆ スタッフ代理結果入力")
+            st.subheader("現在の対戦中卓リスト ＆ スタッフ代理終了")
             if active_matches:
                 match_rows = []
                 for m in reversed(active_matches):
@@ -581,32 +677,21 @@ elif mode == "💻 スタッフ管理画面":
                     })
                 st.table(pd.DataFrame(match_rows))
 
-                with st.expander("🛠️ スタッフが代理で勝敗を入力・卓を強制終了する（スマホ未報告の対応）"):
+                with st.expander("🛠️ スタッフが代理で卓を終了して待機中に戻す（スマホ押し忘れ対応）"):
                     match_options = {
                         m["match_id"]: f"第{m['table']}番卓 ({m['division']}) - " + " vs ".join([data['players'].get(pid, {}).get('name', pid) for pid in m.get("players", [])])
                         for m in active_matches
                     }
-                    target_mid = st.selectbox("操作する卓を選んでください", options=list(match_options.keys()), format_func=lambda x: match_options[x])
+                    target_mid = st.selectbox("終了させる卓を選んでください", options=list(match_options.keys()), format_func=lambda x: match_options[x])
                     target_m = next((m for m in active_matches if m["match_id"] == target_mid), None)
                     
                     if target_m:
-                        m_pids = target_m.get("players", [])
-                        winner_options = ["勝敗なし（全員そのまま待機中に戻す）"] + m_pids
-                        winner_choice = st.radio(
-                            "勝者を選んでください",
-                            options=winner_options,
-                            format_func=lambda x: x if x.startswith("勝敗なし") else f"⭕ {x}: {data['players'].get(x, {}).get('name', '不明')} の勝ち"
-                        )
-                        if st.button("✅ この内容で対戦を終了し、メンバーを待機中に戻す"):
+                        if st.button("✅ この卓の対戦を終了し、メンバー全員を待機中に戻す"):
                             target_m["status"] = "終了"
-                            for pid in m_pids:
+                            for pid in target_m.get("players", []):
                                 if pid in data["players"]:
                                     data["players"][pid]["status"] = "待機中"
-                                    if not winner_choice.startswith("勝敗なし"):
-                                        if pid == winner_choice:
-                                            data["players"][pid]["wins"] += 1
-                                        else:
-                                            data["players"][pid]["losses"] += 1
+                                    data["players"][pid]["match_count"] = data["players"][pid].get("match_count", 0) + 1
                             save_data(data)
                             auto_match(target_m["division"], force=False)
                             st.success("対戦を終了し、メンバーを待機中に戻しました！")
@@ -632,8 +717,8 @@ elif mode == "💻 スタッフ管理画面":
                         "名前": p["name"],
                         "DMPID": p.get("dmp_id", ""),
                         "状態": p["status"],
-                        "勝数": p["wins"],
-                        "敗数": p["losses"],
+                        "対戦数": p.get("match_count", 0),
+                        "直前の相手": ", ".join([data["players"].get(op, {}).get("name", op) for op in p.get("last_opponents", [])]),
                         "アンケート": "✅済" if p.get("survey_done") else "❌未",
                         "参加証": "🎫配布済" if p.get("pass_given") else "未配布"
                     }
@@ -688,10 +773,10 @@ elif mode == "💻 スタッフ管理画面":
                         "プレイヤー名": p["name"],
                         "DMPID": p.get("dmp_id", ""),
                         "現在部門": p["division"],
-                        "勝数": p["wins"],
-                        "敗数": p["losses"],
+                        "対戦数": p.get("match_count", 0),
                         "アンケート回答": "回答済" if p.get("survey_done") else "未回答",
-                        "参加証配布": "配布済" if p.get("pass_given") else "未配布"
+                        "参加証配布": "配布済" if p.get("pass_given") else "未配布",
+                        "当選景品": " / ".join(get_winner_prizes(pid))
                     }
                     for pid, p in data["players"].items()
                 ]
@@ -729,12 +814,9 @@ elif mode == "💻 スタッフ管理画面":
 
             st.divider()
             st.subheader("🛡️ 4. イベント全体の丸ごとバックアップ保存・復元（クラウド再起動対策）")
-            st.write("参加者リスト・戦績・現在の卓状況・アンケート回答内容まですべて含んだバックアップファイル（`.json`）を端末に保存したり、保存したファイルから一瞬で元通りに復元できます。")
-            
             col_bk1, col_bk2 = st.columns(2)
             with col_bk1:
                 st.markdown("#### 💾 現在の状態をバックアップ保存")
-                # アンケートCSVの中身もバックアップJSONの中に一緒に同梱する
                 survey_records = []
                 if os.path.exists(SURVEY_FILE):
                     try:
@@ -766,13 +848,11 @@ elif mode == "💻 スタッフ管理画面":
                     if st.button("🔄 このファイルからイベント状態を完全に復元する", use_container_width=True):
                         try:
                             loaded_obj = json.loads(uploaded_bk.getvalue().decode("utf-8"))
-                            # パターンA: フルバックアップ形式（event_data + survey_records）
                             if "event_data" in loaded_obj:
                                 restored_data = normalize_event_data(loaded_obj["event_data"])
                                 save_data(restored_data)
                                 if "survey_records" in loaded_obj and loaded_obj["survey_records"]:
                                     pd.DataFrame(loaded_obj["survey_records"]).to_csv(SURVEY_FILE, index=False, encoding="utf-8-sig")
-                            # パターンB: 単体のイベントデータ形式
                             else:
                                 restored_data = normalize_event_data(loaded_obj)
                                 save_data(restored_data)
@@ -780,7 +860,7 @@ elif mode == "💻 スタッフ管理画面":
                             st.success("🎉 バックアップからの完全復元に成功しました！画面を更新します。")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"ファイルの読み込みに失敗しました。正しいバックアップJSONファイルか確認してください。（詳細: {e}）")
+                            st.error(f"ファイルの読み込みに失敗しました。（詳細: {e}）")
 
         # 3. 手動調整（2人・4人対応） ＆ 参加者削除
         with tab_manual:
@@ -799,15 +879,15 @@ elif mode == "💻 スタッフ管理画面":
                 )
                 table_manual = st.number_input("割り当てる卓番号", min_value=1, max_value=data["total_tables"], value=1)
                 
-                if st.button("選んだメンバーで対戦開始にする"):
+                if st.button("選んだメンバーで対戦開始にする", type="primary"):
                     if len(selected_manual_pids) != req_num:
                         st.error(f"プレイヤーをちょうど {req_num} 人選んでください。")
                     else:
                         for pid in selected_manual_pids:
                             data["players"][pid]["status"] = "対戦中"
-                            for other_pid in selected_manual_pids:
-                                if other_pid != pid:
-                                    data["players"][pid]["opponents"].append(other_pid)
+                            others = [o for o in selected_manual_pids if o != pid]
+                            data["players"][pid]["opponents"].extend(others)
+                            data["players"][pid]["last_opponents"] = others
                         new_mid = f"M_MANUAL_{datetime.now().strftime('%H%M%S')}"
                         data["matches"].append({
                             "match_id": new_mid,
@@ -838,8 +918,7 @@ elif mode == "💻 スタッフ管理画面":
                                 if other_pid != del_pid and other_pid in data["players"]:
                                     data["players"][other_pid]["status"] = "待機中"
                     
-                    if del_pid in data["lottery_winners"]:
-                        data["lottery_winners"].remove(del_pid)
+                    data["lottery_winners"] = [w for w in data["lottery_winners"] if w.get("pid") != del_pid]
                     
                     del_name = data["players"][del_pid]["name"]
                     del data["players"][del_pid]
@@ -849,39 +928,61 @@ elif mode == "💻 スタッフ管理画面":
             else:
                 st.info("現在登録されている参加者はいません。")
 
-        # 4. 抽選機能（1〜18人）
+        # 4. 抽選機能（景品・抽選物の選択フォームつき ＆ 誰に何が当たったか一覧表示）
         with tab_lottery:
-            st.subheader("🎁 景品のランダム抽選機能（1〜18人）")
-            num_winners = st.slider("当選させる人数を選んでください（1〜18人）", min_value=1, max_value=18, value=1)
-            exclude_prev = st.checkbox("すでに当選した人は除外する", value=True)
+            st.subheader("🎁 景品のランダム抽選機能（誰に何が当たったか記録）")
             
+            prize_name = st.text_input("🎁 今回抽選する景品名（抽選物）を入力してください", value="ランダム賞（プロモパック）", placeholder="例：特製プレイマット、デッキケース、BOXなど")
+            num_winners = st.slider("この景品を当選させる人数を選んでください（1〜18人）", min_value=1, max_value=18, value=1)
+            exclude_prev = st.checkbox("すでに何かが当選した人は除外する", value=True)
+            
+            already_won_pids = {w.get("pid") for w in data["lottery_winners"]}
             candidates = [
                 pid for pid in data["players"].keys()
-                if not (exclude_prev and pid in data["lottery_winners"])
+                if not (exclude_prev and pid in already_won_pids)
             ]
             st.write(f"現在の抽選対象人数: **{len(candidates)}名** （全参加者: {len(data['players'])}名）")
 
-            if st.button("🎲 抽選スタート！"):
-                if len(candidates) == 0:
+            if st.button("🎲 この景品で抽選スタート！", type="primary", use_container_width=True):
+                if not prize_name:
+                    st.error("景品名（抽選物）を入力してください。")
+                elif len(candidates) == 0:
                     st.error("抽選できる対象者がいません。")
                 else:
                     actual_draw = min(num_winners, len(candidates))
                     winners = random.sample(candidates, actual_draw)
-                    data["lottery_winners"].extend(winners)
+                    now_hm = datetime.now().strftime("%H:%M:%S")
+                    for wid in winners:
+                        data["lottery_winners"].append({
+                            "pid": wid,
+                            "prize": prize_name,
+                            "time": now_hm
+                        })
                     save_data(data)
                     st.balloons()
-                    if actual_draw < num_winners:
-                        st.warning(f"対象者が{len(candidates)}名だったため、{actual_draw}名を当選としました！")
-                    else:
-                        st.success(f"{actual_draw}名の当選者が決定しました！（プレイヤーのスマホ画面にも当選通知が出ます）")
+                    st.success(f"🎉 「{prize_name}」の当選者 {actual_draw}名 が決定しました！（プレイヤーのスマホ画面にも当たった景品名が出ます）")
+                    st.rerun()
 
             if data["lottery_winners"]:
-                st.write("### 🏆 これまでの当選者リスト")
-                for wid in data["lottery_winners"]:
+                st.divider()
+                st.subheader("🏆 当選者 ＆ 当たった景品リスト")
+                winner_rows = []
+                for idx, w in enumerate(reversed(data["lottery_winners"]), 1):
+                    wid = w.get("pid")
                     if wid in data["players"]:
                         p_win = data["players"][wid]
-                        st.write(f"- **{wid}: {p_win['name']}** さん [DMPID: {p_win.get('dmp_id', '')}]（{p_win['division']}）")
-                if st.button("当選履歴をリセット"):
+                        winner_rows.append({
+                            "抽選時刻": w.get("time", "-"),
+                            "景品（当たった物）": f"🎁 {w.get('prize', '景品')}",
+                            "受付ID": wid,
+                            "当選プレイヤー名": p_win["name"],
+                            "DMPID": p_win.get("dmp_id", ""),
+                            "所属部門": p_win["division"]
+                        })
+                if winner_rows:
+                    st.table(pd.DataFrame(winner_rows))
+                
+                if st.button("🗑️ 当選履歴をすべてリセット"):
                     data["lottery_winners"] = []
                     save_data(data)
                     st.rerun()
@@ -948,7 +1049,7 @@ elif mode == "💻 スタッフ管理画面":
                     st.rerun()
 
             st.divider()
-            st.subheader("⚙️ 部門の追加・会場設定・自動更新の秒数変更")
+            st.subheader("⚙️ 部門の追加・会場設定・スタッフ画面の自動マッチング秒数変更")
             new_div_name = st.text_input("新しく追加する部門名（名前に『デュエパ』を入れると4人卓になります）")
             if st.button("部門を追加") and new_div_name:
                 if new_div_name not in data["divisions"]:
@@ -960,15 +1061,15 @@ elif mode == "💻 スタッフ管理画面":
             data["total_tables"] = st.number_input("会場の最大卓数", min_value=1, max_value=200, value=data["total_tables"])
             data["min_wait_players"] = st.number_input("通常部門（2人戦）で自動マッチングを開始する待機人数", min_value=2, max_value=20, value=data["min_wait_players"])
             data["refresh_sec"] = st.number_input(
-                "⏱️ 自動画面更新＆自動マッチングの間隔（秒） ※10秒〜300秒で設定可能",
+                "⏱️ スタッフ画面の自動更新＆自動マッチング間隔（秒） ※10秒〜300秒で設定可能",
                 min_value=10,
                 max_value=300,
                 value=int(data.get("refresh_sec", 30)),
                 step=5
             )
-            if st.button("💾 会場・秒数設定を保存"):
+            if st.button("💾 会場・秒数設定を保存", type="primary"):
                 save_data(data)
-                st.success(f"設定を保存しました！（自動更新間隔: {data['refresh_sec']}秒）")
+                st.success(f"設定を保存しました！（スタッフ画面の自動マッチング間隔: {data['refresh_sec']}秒）")
                 st.rerun()
 
             st.divider()
@@ -983,7 +1084,7 @@ elif mode == "💻 スタッフ管理画面":
                     st.error("空欄にはできません。")
 
 # ==========================================
-# 📝 アンケート回答画面（固定された名前を自動で一番上にセット）
+# 📝 アンケート回答画面（文言入れ替え反映済）
 # ==========================================
 elif mode == "📝 アンケート回答":
     st.title("📝 イベント参加者アンケート")
@@ -1014,10 +1115,10 @@ elif mode == "📝 アンケート回答":
             q_div = st.multiselect("本日遊んだ部門を教えてください", data["divisions"], default=[p_survey_info["division"]] if p_survey_info["division"] in data["divisions"] else [])
             q_satisfaction = st.radio("イベントの満足度を教えてください", ["5: とても満足", "4: 満足", "3: 普通", "2: やや不満", "1: 不満"])
             q_wait = st.radio("対戦の待ち時間はいかがでしたか？", ["とてもスムーズだった", "ちょうどよかった", "少し待った", "待ち時間が長かった"])
-            q_comment = st.text_area("スタッフへのメッセージや、次回やってほしい企画があれば自由に書いてください！")
+            q_comment = st.text_area("参加してみて、ここが良かったなーとか勉強になったなーってポイントを教えてください")
             q_app_feedback = st.text_area("アプリについて・今後追加してほしい機能など（任意・空欄でもOK）")
             
-            submitted = st.form_submit_button("回答を送信する")
+            submitted = st.form_submit_button("回答を送信する", type="primary", use_container_width=True)
             if submitted:
                 new_row = pd.DataFrame([{
                     "イベント名": current_event,
@@ -1028,7 +1129,7 @@ elif mode == "📝 アンケート回答":
                     "参加部門": " / ".join(q_div),
                     "満足度": q_satisfaction,
                     "待ち時間評価": q_wait,
-                    "自由記述": q_comment,
+                    "良かった・勉強になったポイント": q_comment,
                     "アプリへの要望": q_app_feedback
                 }])
                 if os.path.exists(SURVEY_FILE):
