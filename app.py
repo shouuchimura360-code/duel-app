@@ -6,58 +6,30 @@ import json
 import socket
 import io
 import qrcode
-import subprocess
-import re
-import time
-import ctypes
 from datetime import datetime
 
 # 画面の基本設定
 st.set_page_config(page_title="デュエマ イベント運営アプリ", layout="wide")
 
 # ==========================================
-# 🛡️ パソコンのスリープ・画面暗転を自動で防ぐ機能（Windows用）
+# 🛡️ パソコンで動かしている時だけスリープ防止を作動（クラウド上では自動でスキップ）
 # ==========================================
 def prevent_sleep():
-    try:
-        ES_CONTINUOUS = 0x80000000
-        ES_SYSTEM_REQUIRED = 0x00000001
-        ES_DISPLAY_REQUIRED = 0x00000002
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-        )
-        return True
-    except Exception:
-        return False
+    if os.name == "nt":  # Windowsパソコンで直接動かしている場合のみ実行
+        try:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_DISPLAY_REQUIRED = 0x00000002
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+            return True
+        except Exception:
+            return False
+    return False
 
 SLEEP_PREVENTED = prevent_sleep()
-
-# ==========================================
-# 🌐 インターネット公開URLを自動で発行・取得する機能
-# ==========================================
-@st.cache_resource
-def start_cloudflare_tunnel():
-    try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", "http://localhost:8501"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore"
-        )
-        url_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
-        start_time = time.time()
-        while time.time() - start_time < 15:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            match = url_pattern.search(line)
-            if match:
-                return match.group(0)
-        return None
-    except Exception:
-        return None
 
 def get_local_ip():
     try:
@@ -69,6 +41,7 @@ def get_local_ip():
     except Exception:
         return "localhost"
 
+# データの保存先フォルダ
 EVENTS_DIR = "events_data"
 CONFIG_FILE = os.path.join(EVENTS_DIR, "config.json")
 os.makedirs(EVENTS_DIR, exist_ok=True)
@@ -90,13 +63,16 @@ def load_config():
             cfg = json.load(f)
             if "admin_password" not in cfg:
                 cfg["admin_password"] = "1234"
+            if "app_url" not in cfg:
+                cfg["app_url"] = ""
             return cfg
     else:
         default_event = datetime.now().strftime("%Y-%m-%d_第1回イベント")
         cfg = {
             "current_event": default_event,
             "events": [default_event],
-            "admin_password": "1234"
+            "admin_password": "1234",
+            "app_url": ""
         }
         save_config(cfg)
         return cfg
@@ -109,16 +85,19 @@ config = load_config()
 current_event = config["current_event"]
 
 DATA_FILE = os.path.join(EVENTS_DIR, f"{current_event}.json")
-SURVEY_FILE = os.path.join(EVENTS_DIR, f"{current_event}_survey.csv")
+SURVEY_FILE = os.path.join(EVENTS_DIR, f"{current_event}_アンケート結果.csv")
+PLAYERS_CSV_FILE = os.path.join(EVENTS_DIR, f"{current_event}_参加者リスト.csv")
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-            # 古いデータ形式（p1, p2）を新しい複数人対応形式（playersリスト）に自動変換
             for m in d.get("matches", []):
                 if "players" not in m:
                     m["players"] = [m.get("p1"), m.get("p2")]
+            for pid, p in d.get("players", {}).items():
+                if "dmp_id" not in p:
+                    p["dmp_id"] = ""
             return d
     else:
         init_data = get_Initial_event_data()
@@ -141,19 +120,17 @@ def auto_match(division_name):
     used_tables = [m["table"] for m in data["matches"] if m["status"] == "対戦中"]
     free_tables = [t for t in range(1, data["total_tables"] + 1) if t not in used_tables]
 
-    # ★ デュエパ部門（4人マッチング・一部重複OK）の場合
+    # ★ デュエパ部門（4人マッチング・一部重複OK）
     if "デュエパ" in division_name:
         if len(waiting_ids) < 4:
             return 0
             
         random.shuffle(waiting_ids)
-        # 過去に全く同じ4人で組んだ履歴を取得
         past_groups = [set(m.get("players", [])) for m in data["matches"] if m["division"] == division_name]
         
         matched_count = 0
         while len(waiting_ids) >= 4 and free_tables:
             group = waiting_ids[:4]
-            # もし4人全員が過去と全く同じ組み合わせで、他に待機者がいるなら少しシャッフルして調整
             if set(group) in past_groups and len(waiting_ids) > 4:
                 for _ in range(5):
                     random.shuffle(waiting_ids)
@@ -185,7 +162,7 @@ def auto_match(division_name):
             save_data(data)
         return matched_count
 
-    # ★ 通常部門（2人マッチング・過去対戦者を回避）の場合
+    # ★ 通常部門（2人マッチング・過去対戦者を回避）
     else:
         if len(waiting_ids) < data["min_wait_players"]:
             return 0
@@ -237,7 +214,7 @@ def auto_match(division_name):
 st.sidebar.title("メニュー切り替え")
 st.sidebar.caption(f"現在開催中: **{current_event}**")
 if SLEEP_PREVENTED:
-    st.sidebar.success("🛡️ PCスリープ・暗転防止：作動中")
+    st.sidebar.success("🛡️ PCスリープ防止：作動中")
 
 mode = st.sidebar.radio("画面を選んでください", ["📱 プレイヤー画面", "💻 スタッフ管理画面", "📝 アンケート回答"])
 
@@ -245,7 +222,7 @@ if st.sidebar.button("🔄 画面を最新状態に更新"):
     st.rerun()
 
 # ==========================================
-# 📱 プレイヤー画面（スマホ用）
+# 📱 プレイヤー画面（スマホ・PC共通）
 # ==========================================
 if mode == "📱 プレイヤー画面":
     st.title("🐉 デュエマ イベント プレイヤー画面")
@@ -258,6 +235,7 @@ if mode == "📱 プレイヤー画面":
     
     with tab2:
         new_name = st.text_input("あなたのプレイヤー名（ハンドルネーム）を入力")
+        new_dmp_id = st.text_input("DMPIDを入力（番号）")
         init_div = st.selectbox("最初に参加する部門を選択", data["divisions"])
         if st.button("イベントに参加登録する"):
             if new_name:
@@ -267,6 +245,7 @@ if mode == "📱 プレイヤー画面":
                 
                 data["players"][new_id] = {
                     "name": new_name,
+                    "dmp_id": new_dmp_id,
                     "division": init_div,
                     "status": "待機中",
                     "wins": 0,
@@ -277,6 +256,8 @@ if mode == "📱 プレイヤー画面":
                 auto_match(init_div)
                 st.success(f"登録完了！あなたのIDは「{new_id} ({new_name})」です。「すでに参加登録済みの方」タブから選んでください。")
                 st.rerun()
+            else:
+                st.error("プレイヤー名を入力してください。")
 
     with tab1:
         if not player_names:
@@ -289,7 +270,7 @@ if mode == "📱 プレイヤー画面":
             )
             
             p_info = data["players"][selected_pid]
-            st.write(f"**現在の部門:** {p_info['division']} ｜ **状態:** {p_info['status']} ｜ **戦績:** {p_info['wins']}勝 {p_info['losses']}敗")
+            st.write(f"**DMPID:** {p_info.get('dmp_id', '未登録')} ｜ **現在の部門:** {p_info['division']} ｜ **状態:** {p_info['status']} ｜ **戦績:** {p_info['wins']}勝 {p_info['losses']}敗")
 
             if selected_pid in data["lottery_winners"]:
                 st.balloons()
@@ -304,7 +285,6 @@ if mode == "📱 プレイヤー画面":
                     
                     st.info(f"🔥 **【対戦案内】 第 {current_match['table']} 番卓** へ移動してください！\n\n**対戦相手:** {' さん / '.join(other_names)} さん（{current_match['division']}部門）")
                     
-                    # 4人対戦（デュエパ）の場合の終了報告
                     if len(m_players) > 2:
                         st.write("--- 対戦が終わったら代表者1名が結果ボタンを押してください（全員が待機中に戻ります） ---")
                         col1, col2 = st.columns(2)
@@ -332,7 +312,6 @@ if mode == "📱 プレイヤー画面":
                             st.info("対戦終了！4人全員が次のマッチング待機中に戻りました。")
                             st.rerun()
 
-                    # 2人対戦（通常部門）の場合の終了報告
                     else:
                         opp_id = other_pids[0] if other_pids else None
                         st.write("--- 対戦が終わったら結果を報告してください ---")
@@ -415,15 +394,16 @@ elif mode == "💻 スタッフ管理画面":
 
         st.info(f"📁 現在操作中のイベント: **{current_event}**")
 
-        tab_status, tab_manual, tab_lottery, tab_qr, tab_settings = st.tabs([
+        tab_status, tab_csv, tab_manual, tab_lottery, tab_qr, tab_settings = st.tabs([
             "📊 卓状況・待機リスト",
+            "📥 CSV出力（参加者・アンケート）",
             "🤝 手動ペアリング・参加者削除",
             "🎁 抽選（1〜18人）",
             "📱 参加者用QRコード",
             "⚙️ イベント・会場設定"
         ])
 
-        # 1. リアルタイム確認
+        # 1. リアルタイム卓状況
         with tab_status:
             st.subheader("現在の対戦中卓リスト")
             active_matches = [m for m in data["matches"] if m["status"] == "対戦中"]
@@ -451,7 +431,15 @@ elif mode == "💻 スタッフ管理画面":
                     st.rerun()
                     
                 div_players = [
-                    {"ID": pid, "名前": p["name"], "状態": p["status"], "勝数": p["wins"], "敗数": p["losses"], "延べ対戦人数": len(p["opponents"])}
+                    {
+                        "ID": pid,
+                        "名前": p["name"],
+                        "DMPID": p.get("dmp_id", ""),
+                        "状態": p["status"],
+                        "勝数": p["wins"],
+                        "敗数": p["losses"],
+                        "延べ対戦人数": len(p["opponents"])
+                    }
                     for pid, p in data["players"].items() if p["division"] == div
                 ]
                 with st.expander(f"【{div}】 参加人数: {len(div_players)}名", expanded=True):
@@ -460,7 +448,55 @@ elif mode == "💻 スタッフ管理画面":
                     else:
                         st.write("参加者なし")
 
-        # 2. 手動調整（2人・4人対応） ＆ 参加者削除
+        # 2. CSV出力専用タブ（参加者リスト ＆ アンケート結果の両方に対応）
+        with tab_csv:
+            st.subheader("📊 1. 参加者リスト（名前・DMPID）のCSVダウンロード")
+            if data["players"]:
+                player_export_list = [
+                    {
+                        "受付ID": pid,
+                        "プレイヤー名": p["name"],
+                        "DMPID": p.get("dmp_id", ""),
+                        "現在部門": p["division"],
+                        "勝数": p["wins"],
+                        "敗数": p["losses"]
+                    }
+                    for pid, p in data["players"].items()
+                ]
+                df_export = pd.DataFrame(player_export_list)
+                df_export.to_csv(PLAYERS_CSV_FILE, index=False, encoding="utf-8-sig")
+                csv_bytes = df_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                
+                st.download_button(
+                    label="📥 参加者リスト（名前・DMPID）をCSVで保存する",
+                    data=csv_bytes,
+                    file_name=f"{current_event}_参加者リスト.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+                st.dataframe(df_export, use_container_width=True)
+            else:
+                st.info("まだ参加者が登録されていません。")
+
+            st.divider()
+            st.subheader("📝 2. アンケート回答結果のCSVダウンロード")
+            if os.path.exists(SURVEY_FILE):
+                df_survey = pd.read_csv(SURVEY_FILE, encoding="utf-8-sig")
+                survey_bytes = df_survey.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                
+                st.download_button(
+                    label="📥 アンケート回答結果をCSVで保存する",
+                    data=survey_bytes,
+                    file_name=f"{current_event}_アンケート結果.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+                st.write(f"現在の回答件数: **{len(df_survey)}件**")
+                st.dataframe(df_survey, use_container_width=True)
+            else:
+                st.info("まだアンケートの回答はありません。")
+
+        # 3. 手動調整（2人・4人対応） ＆ 参加者削除
         with tab_manual:
             st.subheader("🤝 手動でペアリング（2人卓 または 4人卓の作成）")
             waiting_list = {pid: f"{pid}: {p['name']} ({p['division']})" for pid, p in data["players"].items() if p["status"] == "待機中"}
@@ -502,7 +538,7 @@ elif mode == "💻 スタッフ管理画面":
             st.divider()
             st.subheader("🗑️ 参加者の削除（登録ミス・途中帰宅の対応）")
             if data["players"]:
-                all_players = {pid: f"{pid}: {p['name']} （{p['division']} / {p['status']}）" for pid, p in data["players"].items()}
+                all_players = {pid: f"{pid}: {p['name']} [DMPID:{p.get('dmp_id', '')}] （{p['division']} / {p['status']}）" for pid, p in data["players"].items()}
                 del_pid = st.selectbox("削除するプレイヤーを選んでください", list(all_players.keys()), format_func=lambda x: all_players[x])
                 
                 if st.button("🚨 選択したプレイヤーを削除する"):
@@ -524,7 +560,7 @@ elif mode == "💻 スタッフ管理画面":
             else:
                 st.info("現在登録されている参加者はいません。")
 
-        # 3. 抽選機能（1〜18人）
+        # 4. 抽選機能（1〜18人）
         with tab_lottery:
             st.subheader("🎁 景品のランダム抽選機能（1〜18人）")
             num_winners = st.slider("当選させる人数を選んでください（1〜18人）", min_value=1, max_value=18, value=1)
@@ -554,29 +590,26 @@ elif mode == "💻 スタッフ管理画面":
                 st.write("### 🏆 これまでの当選者リスト")
                 for wid in data["lottery_winners"]:
                     if wid in data["players"]:
-                        st.write(f"- **{wid}: {data['players'][wid]['name']}** さん（{data['players'][wid]['division']}）")
+                        p_win = data["players"][wid]
+                        st.write(f"- **{wid}: {p_win['name']}** さん [DMPID: {p_win.get('dmp_id', '')}]（{p_win['division']}）")
                 if st.button("当選履歴をリセット"):
                     data["lottery_winners"] = []
                     save_data(data)
                     st.rerun()
 
-        # 4. 参加者用QRコード作成・表示
+        # 5. 参加者用QRコード作成・表示（クラウド固定URLの保存機能つき）
         with tab_qr:
             st.subheader("📱 参加者スマホ読み取り用 QRコード")
+            st.write("クラウド公開したURL（`https://xxxx.streamlit.app`）を一度入力して保存しておくと、いつでも同じQRコードを表示・印刷できます。")
             
-            with st.spinner("🌐 インターネット公開用URLを自動取得中...（初回のみ数秒かかります）"):
-                public_url = start_cloudflare_tunnel()
+            saved_url = config.get("app_url", "")
+            default_qr_url = saved_url if saved_url else f"http://{get_local_ip()}:8501"
             
-            local_url = f"http://{get_local_ip()}:8501"
-            
-            if public_url:
-                st.success("✅ **4G/5G回線対応のインターネット公開URLが自動発行されました！**\n\n参加者はWi-Fiに繋がなくても、自分のスマホの電波でそのまま読み取れます。")
-                default_qr_url = public_url
-            else:
-                st.warning("⚠️ インターネット公開URLの自動取得ができませんでした（cloudflaredが未導入かオフラインです）。同じWi-Fi用のURLを表示しています。")
-                default_qr_url = local_url
-
-            qr_url = st.text_input("QRコードにするURL（自動設定済み）", value=default_qr_url)
+            qr_url = st.text_input("アプリのURLを入力してください", value=default_qr_url)
+            if st.button("💾 このURLを初期値として保存する"):
+                config["app_url"] = qr_url
+                save_config(config)
+                st.success("URLを保存しました！")
             
             if qr_url:
                 qr = qrcode.QRCode(version=1, box_size=8, border=2)
@@ -590,13 +623,13 @@ elif mode == "💻 スタッフ管理画面":
                 
                 st.image(byte_im, caption=f"読み取りURL: {qr_url}", width=300)
                 st.download_button(
-                    label="📥 QRコード画像をパソコンに保存する（印刷用）",
+                    label="📥 QRコード画像を保存する（印刷用）",
                     data=byte_im,
                     file_name="event_qr.png",
                     mime="image/png"
                 )
 
-        # 5. イベント管理・会場設定・パスワード変更
+        # 6. イベント管理・会場設定・パスワード変更
         with tab_settings:
             st.subheader("📅 イベントの新規作成・切り替え")
             col_ev1, col_ev2 = st.columns(2)
@@ -685,4 +718,4 @@ elif mode == "📝 アンケート回答":
             else:
                 new_row.to_csv(SURVEY_FILE, mode="w", header=True, index=False, encoding="utf-8-sig")
             
-            st.success(f"ご回答ありがとうございました！「{SURVEY_FILE}」に自動保存されました。")
+            st.success("ご回答ありがとうございました！回答データが保存されました。")
