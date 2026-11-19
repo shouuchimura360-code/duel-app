@@ -446,7 +446,6 @@ def set_player_break_and_rematch(target_pid):
     affected_divisions = set()
     affected_divisions.add(latest_data["players"][target_pid]["division"])
 
-    # 対戦中の卓があればキャンセル（解散）し、対戦相手を待機中に戻す
     for m in latest_data["matches"]:
         if m["status"] == "対戦中" and target_pid in m.get("players", []):
             m["status"] = "キャンセル"
@@ -454,7 +453,6 @@ def set_player_break_and_rematch(target_pid):
             for other_pid in m.get("players", []):
                 if other_pid != target_pid and other_pid in latest_data["players"]:
                     latest_data["players"][other_pid]["status"] = "待機中"
-                    # 直前対戦履歴からキャンセルになった相手を戻す
                     if target_pid in latest_data["players"][other_pid].get("last_opponents", []):
                         latest_data["players"][other_pid]["last_opponents"].remove(target_pid)
                     if target_pid in latest_data["players"][other_pid].get("opponents", []):
@@ -464,7 +462,39 @@ def set_player_break_and_rematch(target_pid):
     save_data(latest_data)
     data = latest_data
 
-    # 待機中に戻ったプレイヤーたちで別のマッチングを自動再編成
+    for div in affected_divisions:
+        auto_match(div, force=False)
+
+# --- 組み合わせ発表後（対戦中）でも部門を変更して再マッチングする処理 ---
+def change_division_and_rematch(target_pid, new_div):
+    global data
+    latest_data = load_data()
+    if target_pid not in latest_data["players"]:
+        return
+
+    old_div = latest_data["players"][target_pid]["division"]
+    affected_divisions = {old_div, new_div}
+
+    # 対戦中の卓があればキャンセル（解散）し、元の対戦相手を待機中に戻す
+    for m in latest_data["matches"]:
+        if m["status"] == "対戦中" and target_pid in m.get("players", []):
+            m["status"] = "キャンセル"
+            affected_divisions.add(m["division"])
+            for other_pid in m.get("players", []):
+                if other_pid != target_pid and other_pid in latest_data["players"]:
+                    latest_data["players"][other_pid]["status"] = "待機中"
+                    if target_pid in latest_data["players"][other_pid].get("last_opponents", []):
+                        latest_data["players"][other_pid]["last_opponents"].remove(target_pid)
+                    if target_pid in latest_data["players"][other_pid].get("opponents", []):
+                        latest_data["players"][other_pid]["opponents"].remove(target_pid)
+
+    # 本人の部門を更新し、新しい部門の待機中にセット
+    latest_data["players"][target_pid]["division"] = new_div
+    latest_data["players"][target_pid]["status"] = "待機中"
+    save_data(latest_data)
+    data = latest_data
+
+    # 元の部門・新しい部門の両方で自動再マッチングを実行
     for div in affected_divisions:
         auto_match(div, force=False)
 
@@ -592,6 +622,19 @@ if mode == "プレイヤー画面":
                         st.rerun()
 
                 st.write("")
+                # 組み合わせ発表後でも部門を変更して再マッチングできる折りたたみメニュー
+                with st.expander("部門を変更して別の対戦相手と再マッチングする"):
+                    st.warning("**【注意】** 部門を変更すると、現在の対戦卓は解散となり、対戦相手は元の部門で再マッチングされます。あなたは新しい部門で再マッチング待機に入ります。")
+                    div_idx_active = data["divisions"].index(p_info["division"]) if p_info["division"] in data["divisions"] else 0
+                    new_div_active = st.selectbox("変更先の部門を選択してください", data["divisions"], index=div_idx_active, key="sel_div_in_match")
+                    if st.button("この部門に変更して再マッチングする", key="btn_div_in_match", use_container_width=True):
+                        if new_div_active == p_info["division"]:
+                            st.error("現在と同じ部門が選ばれています。別の部門を選択してください。")
+                        else:
+                            change_division_and_rematch(selected_pid, new_div_active)
+                            st.success(f"部門を「{new_div_active}」に変更し、再マッチングを実行しました！")
+                            st.rerun()
+
                 with st.expander("急用・休憩などでこの対戦をキャンセルして休憩する（再マッチング）"):
                     st.warning("**【注意】** 休憩中に切り替えると、この対戦卓は解散となり、対戦相手は別の相手と再マッチングされます。本当に休憩しますか？")
                     confirm_match_break = st.checkbox("注意を確認しました（対戦をキャンセルして休憩中に入る）", key="chk_match_break")
@@ -739,18 +782,18 @@ elif mode == "スタッフ管理画面":
                         })
                     st.table(pd.DataFrame(match_rows))
 
-                    col_op1, col_op2 = st.columns(2)
+                    col_op1, col_op2, col_op3 = st.columns(3)
                     with col_op1:
-                        with st.expander("スタッフが代理で卓を終了して待機中に戻す"):
+                        with st.expander("代理で卓を終了して待機中に戻す"):
                             match_options = {
                                 m["match_id"]: f"第{m['table']}番卓 ({m['division']}) - " + " vs ".join([data['players'].get(pid, {}).get('name', pid) for pid in m.get("players", [])])
                                 for m in active_matches
                             }
-                            target_mid = st.selectbox("終了させる卓を選んでください", options=list(match_options.keys()), format_func=lambda x: match_options[x])
+                            target_mid = st.selectbox("終了させる卓を選択", options=list(match_options.keys()), format_func=lambda x: match_options[x])
                             target_m = next((m for m in active_matches if m["match_id"] == target_mid), None)
                             
                             if target_m:
-                                if st.button("この卓の対戦を終了し、メンバー全員を待機中に戻す"):
+                                if st.button("対戦を終了して待機中に戻す"):
                                     target_m["status"] = "終了"
                                     for pid in target_m.get("players", []):
                                         if pid in data["players"]:
@@ -758,20 +801,34 @@ elif mode == "スタッフ管理画面":
                                             data["players"][pid]["match_count"] = data["players"][pid].get("match_count", 0) + 1
                                     save_data(data)
                                     auto_match(target_m["division"], force=False)
-                                    st.success("対戦を終了し、メンバーを待機中に戻しました！")
+                                    st.success("対戦を終了し、待機中に戻しました！")
                                     st.rerun()
 
                     with col_op2:
-                        with st.expander("特定のプレイヤーを休憩中にして別マッチングを組み直す"):
+                        with st.expander("特定の人の部門を変更して再マッチング"):
+                            all_active_opts = {
+                                pid: f"{pid}: {p['name']} ({p['division']} / {p['status']})"
+                                for pid, p in data["players"].items()
+                            }
+                            if all_active_opts:
+                                chg_pid = st.selectbox("部門を変更する人を選択", options=list(all_active_opts.keys()), format_func=lambda x: all_active_opts[x], key="staff_chg_div_pid")
+                                chg_new_div = st.selectbox("変更先の部門", options=data["divisions"], key="staff_chg_div_name")
+                                if st.button("部門変更＆再マッチング実行"):
+                                    change_division_and_rematch(chg_pid, chg_new_div)
+                                    st.success("部門を変更し、再マッチングを実行しました！")
+                                    st.rerun()
+
+                    with col_op3:
+                        with st.expander("特定の人に休憩を入れて再マッチング"):
                             active_player_opts = {
                                 pid: f"{pid}: {p['name']} ({p['division']} / {p['status']})"
                                 for pid, p in data["players"].items() if p["status"] in ["対戦中", "待機中"]
                             }
                             if active_player_opts:
-                                break_pid = st.selectbox("休憩中に切り替えるプレイヤーを選択", options=list(active_player_opts.keys()), format_func=lambda x: active_player_opts[x], key="staff_break_pid")
-                                if st.button("この人を休憩中にし、残った人で再マッチングする"):
+                                break_pid = st.selectbox("休憩中にする人を選択", options=list(active_player_opts.keys()), format_func=lambda x: active_player_opts[x], key="staff_break_pid")
+                                if st.button("休憩中に切替＆再マッチング"):
                                     set_player_break_and_rematch(break_pid)
-                                    st.success("休憩中に切り替え、残りのプレイヤーで再マッチングを実行しました！")
+                                    st.success("休憩中に切り替え、再マッチングを実行しました！")
                                     st.rerun()
                             else:
                                 st.write("対象のプレイヤーがいません。")
