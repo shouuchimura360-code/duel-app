@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import random
 import os
@@ -6,7 +7,13 @@ import json
 import socket
 import io
 import qrcode
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# 日本標準時（JST: UTC+9）の定義
+JST = timezone(timedelta(hours=9))
+
+def now_jst():
+    return datetime.now(JST)
 
 # 画面の基本設定
 st.set_page_config(page_title="ティーチャーファンイベント", layout="wide")
@@ -125,7 +132,7 @@ def load_config():
                 cfg["app_url"] = ""
             return cfg
     else:
-        default_event = datetime.now().strftime("%Y-%m-%d_第1回イベント")
+        default_event = now_jst().strftime("%Y-%m-%d_第1回イベント")
         cfg = {
             "current_event": default_event,
             "events": [default_event],
@@ -178,7 +185,7 @@ def normalize_event_data(d):
         if "players" not in m:
             m["players"] = [m.get("p1"), m.get("p2")]
         if "created_at" not in m:
-            m["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            m["created_at"] = now_jst().strftime("%Y-%m-%d %H:%M:%S")
     for pid, p in d.get("players", {}).items():
         if "dmp_id" not in p:
             p["dmp_id"] = ""
@@ -211,7 +218,56 @@ def save_data(d):
 data = load_data()
 refresh_sec = data.get("refresh_sec", 60)
 
-# --- 自分の名前（ID）を記憶・固定する機能（一度登録したら変更不可） ---
+# --- ブラウザを閉じても登録を維持する機能（localStorage + URLパラメータ連携） ---
+STORAGE_KEY = f"teacher_event_pid_{current_event}"
+
+def sync_browser_storage(current_pid):
+    safe_key = json.dumps(STORAGE_KEY)
+    safe_pid = json.dumps(current_pid if current_pid else "")
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const key = {safe_key};
+            const currentPid = {safe_pid};
+            try {{
+                if (currentPid) {{
+                    window.parent.localStorage.setItem(key, currentPid);
+                }} else {{
+                    const savedPid = window.parent.localStorage.getItem(key);
+                    const url = new URL(window.parent.location.href);
+                    if (savedPid && !url.searchParams.get("pid")) {{
+                        url.searchParams.set("pid", savedPid);
+                        window.parent.location.replace(url.toString());
+                    }}
+                }}
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+def clear_browser_storage_if_deleted(raw_pid):
+    if raw_pid and raw_pid not in data["players"]:
+        safe_key = json.dumps(STORAGE_KEY)
+        components.html(
+            f"""
+            <script>
+            try {{
+                window.parent.localStorage.removeItem({safe_key});
+            }} catch (e) {{}}
+            </script>
+            """,
+            height=0,
+        )
+        if "pid" in st.query_params:
+            del st.query_params["pid"]
+        st.session_state.pinned_pid = None
+
+raw_url_pid = st.query_params.get("pid", None)
+clear_browser_storage_if_deleted(raw_url_pid)
+
 def get_pinned_pid():
     if "pinned_pid" in st.session_state and st.session_state.pinned_pid in data["players"]:
         return st.session_state.pinned_pid
@@ -226,16 +282,18 @@ def set_pinned_pid(pid):
         st.session_state.pinned_pid = pid
         st.query_params["pid"] = pid
 
+sync_browser_storage(get_pinned_pid())
+
 def get_winner_prizes(pid):
     return [w.get("prize", "景品") for w in data["lottery_winners"] if w.get("pid") == pid]
 
-# --- 経過時間を計算して「新着」かどうか判定する関数 ---
+# --- 経過時間を日本時間で計算して「新着」かどうか判定する関数 ---
 def get_match_age_info(m):
     created_str = m.get("created_at", "")
     try:
-        dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
-        diff_sec = (datetime.now() - dt).total_seconds()
-        mins = int(diff_sec // 60)
+        dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=JST)
+        diff_sec = (now_jst() - dt).total_seconds()
+        mins = max(0, int(diff_sec // 60))
         time_only = dt.strftime("%H:%M:%S")
         is_new = (diff_sec <= 180) or (m.get("match_id") in data.get("last_created_match_ids", []))
         return is_new, time_only, f"{mins}分前" if mins > 0 else "たった今"
@@ -253,7 +311,7 @@ def auto_match(division_name, force=False):
     free_tables = [t for t in range(1, data["total_tables"] + 1) if t not in used_tables]
 
     new_match_ids = []
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_jst().strftime("%Y-%m-%d %H:%M:%S")
 
     # デュエパ部門（4人マッチング・直前と全く同じメンバーや連続同卓を回避）
     if "デュエパ" in division_name:
@@ -293,7 +351,7 @@ def auto_match(division_name, force=False):
                 data["players"][pid]["opponents"].extend(others)
                 data["players"][pid]["last_opponents"] = others
                         
-            match_id = f"M4_{datetime.now().strftime('%H%M%S')}_{table_num}"
+            match_id = f"M4_{now_jst().strftime('%H%M%S')}_{table_num}"
             data["matches"].append({
                 "match_id": match_id,
                 "division": division_name,
@@ -352,7 +410,7 @@ def auto_match(division_name, force=False):
                 data["players"][p1_id]["last_opponents"] = [partner_id]
                 data["players"][partner_id]["last_opponents"] = [p1_id]
                 
-                match_id = f"M2_{datetime.now().strftime('%H%M%S')}_{table_num}"
+                match_id = f"M2_{now_jst().strftime('%H%M%S')}_{table_num}"
                 data["matches"].append({
                     "match_id": match_id,
                     "division": division_name,
@@ -378,6 +436,38 @@ def auto_match_all_divisions(force=False):
         save_data(data)
     return all_new_ids
 
+# --- 休憩中への切り替え＆対戦組み合わせの解散・再マッチング処理 ---
+def set_player_break_and_rematch(target_pid):
+    global data
+    latest_data = load_data()
+    if target_pid not in latest_data["players"]:
+        return
+
+    affected_divisions = set()
+    affected_divisions.add(latest_data["players"][target_pid]["division"])
+
+    # 対戦中の卓があればキャンセル（解散）し、対戦相手を待機中に戻す
+    for m in latest_data["matches"]:
+        if m["status"] == "対戦中" and target_pid in m.get("players", []):
+            m["status"] = "キャンセル"
+            affected_divisions.add(m["division"])
+            for other_pid in m.get("players", []):
+                if other_pid != target_pid and other_pid in latest_data["players"]:
+                    latest_data["players"][other_pid]["status"] = "待機中"
+                    # 直前対戦履歴からキャンセルになった相手を戻す
+                    if target_pid in latest_data["players"][other_pid].get("last_opponents", []):
+                        latest_data["players"][other_pid]["last_opponents"].remove(target_pid)
+                    if target_pid in latest_data["players"][other_pid].get("opponents", []):
+                        latest_data["players"][other_pid]["opponents"].remove(target_pid)
+
+    latest_data["players"][target_pid]["status"] = "休憩中"
+    save_data(latest_data)
+    data = latest_data
+
+    # 待機中に戻ったプレイヤーたちで別のマッチングを自動再編成
+    for div in affected_divisions:
+        auto_match(div, force=False)
+
 auto_match_all_divisions(force=False)
 
 # --- 3. サイドバーメニュー ---
@@ -399,7 +489,7 @@ if st.sidebar.button("画面を最新状態に更新"):
     st.rerun()
 
 # ==========================================
-# プレイヤー画面（最初に登録した名前で完全固定）
+# プレイヤー画面
 # ==========================================
 if mode == "プレイヤー画面":
     st.title("ファンイベントプレイヤー画面")
@@ -407,10 +497,9 @@ if mode == "プレイヤー画面":
 
     pinned_pid = get_pinned_pid()
 
-    # 未登録の場合：新規参加登録のみ表示
     if not pinned_pid:
         st.subheader("参加登録")
-        st.write("プレイヤー名・DMPID・部門を入力して「参加登録する」を押してください（登録後はあなたの専用画面に固定されます）。")
+        st.write("プレイヤー名・DMPID・部門を入力して「参加登録する」を押してください（登録後はブラウザを閉じてもあなたの専用画面に固定されます）。")
         
         new_name = st.text_input("あなたのプレイヤー名（ハンドルネーム）を入力")
         new_dmp_id = st.text_input("DMPIDを入力（番号）")
@@ -443,7 +532,6 @@ if mode == "プレイヤー画面":
             else:
                 st.error("プレイヤー名を入力してください。")
 
-    # 登録済みの場合：最初に登録したプレイヤー専用画面を固定表示（切替ボタンなし）
     else:
         selected_pid = pinned_pid
         p_info = data["players"][selected_pid]
@@ -454,7 +542,7 @@ if mode == "プレイヤー画面":
         pass_badge = "受取済" if p_info.get("pass_given") else "未受取"
         
         st.write(f"**DMPID:** {p_info.get('dmp_id', '未登録')} ｜ **現在の部門:** {p_info['division']} ｜ **状態:** {p_info['status']} ｜ **本日の対戦数:** {p_info.get('match_count', 0)}戦")
-        st.caption(f"アンケート状態: **{survey_badge}** ｜ 参加証: **{pass_badge}**")
+        st.caption(f"アンケート状態: **{survey_badge}** ｜ 参加賞: **{pass_badge}**")
 
         my_prizes = get_winner_prizes(selected_pid)
         if my_prizes:
@@ -470,20 +558,18 @@ if mode == "プレイヤー画面":
                 other_pids = [pid for pid in m_players if pid != selected_pid]
                 other_names = [data["players"].get(pid, {}).get("name", "不明") for pid in other_pids]
                 is_new, time_str, ago_str = get_match_age_info(current_match)
-                new_badge_html = "<div style='color:#d84315; font-weight:bold; font-size:1.2rem;'>【新着マッチング】</div>" if is_new else ""
+                new_badge_html = '<div style="color:#d84315; font-weight:bold; font-size:1.2rem;">【新着マッチング】</div>' if is_new else ""
                 
-                st.markdown(
-                    f"""
-                    <div class="match-card">
-                        {new_badge_html}
-                        <div style="font-size:1.2rem; font-weight:bold; color:#555;">【{current_match['division']}部門】 案内テーブル（開始 {time_str}）</div>
-                        <div class="table-number">第 {current_match['table']} 番卓</div>
-                        <div style="font-size:1.1rem; color:#333;">対戦相手</div>
-                        <div class="opponent-name">{' さん ／ '.join(other_names)} さん</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
+                html_card = (
+                    f'<div class="match-card">'
+                    f'{new_badge_html}'
+                    f'<div style="font-size:1.2rem; font-weight:bold; color:#555;">【{current_match["division"]}部門】 案内テーブル（開始 {time_str}）</div>'
+                    f'<div class="table-number">第 {current_match["table"]} 番卓</div>'
+                    f'<div style="font-size:1.1rem; color:#333;">対戦相手</div>'
+                    f'<div class="opponent-name">{" さん ／ ".join(other_names)} さん</div>'
+                    f'</div>'
                 )
+                st.markdown(html_card, unsafe_allow_html=True)
                 
                 st.write("### 対戦が終わったら下のボタンを押してください（対戦相手のどちらか1人が押せば全員次に進みます）")
                 if st.button("対戦終了！次のマッチングに向かう", use_container_width=True, type="primary"):
@@ -504,6 +590,15 @@ if mode == "プレイヤー画面":
                     else:
                         st.info("すでに対戦相手が終了ボタンを押したため、次のマッチング待機に入っています！")
                         st.rerun()
+
+                st.write("")
+                with st.expander("急用・休憩などでこの対戦をキャンセルして休憩する（再マッチング）"):
+                    st.warning("**【注意】** 休憩中に切り替えると、この対戦卓は解散となり、対戦相手は別の相手と再マッチングされます。本当に休憩しますか？")
+                    confirm_match_break = st.checkbox("注意を確認しました（対戦をキャンセルして休憩中に入る）", key="chk_match_break")
+                    if confirm_match_break:
+                        if st.button("休憩中に切り替える（卓を解散する）", key="btn_match_break"):
+                            set_player_break_and_rematch(selected_pid)
+                            st.rerun()
             else:
                 data["players"][selected_pid]["status"] = "待機中"
                 save_data(data)
@@ -550,7 +645,7 @@ if mode == "プレイヤー画面":
                             st.rerun()
 
 # ==========================================
-# スタッフ管理画面（複数景品の一括抽選機能つき）
+# スタッフ管理画面
 # ==========================================
 elif mode == "スタッフ管理画面":
     st.title("イベント運営・スタッフ管理画面")
@@ -575,8 +670,8 @@ elif mode == "スタッフ管理画面":
 
         tab_status, tab_csv, tab_manual, tab_lottery, tab_qr, tab_settings = st.tabs([
             "卓状況・強制マッチング",
-            "参加証・CSV・バックアップ",
-            "手動ペアリング・参加者削除",
+            "参加賞・CSV・バックアップ",
+            "手動ペアリング・登録者削除",
             "複数景品の一括抽選",
             "参加者用QRコード",
             "イベント・会場設定"
@@ -627,7 +722,7 @@ elif mode == "スタッフ管理画面":
                         st.rerun()
 
                 st.divider()
-                st.subheader("現在の対戦中卓リスト ＆ スタッフ代理終了")
+                st.subheader("現在の対戦中卓リスト ＆ スタッフ代理操作")
                 if active_matches:
                     match_rows = []
                     for m in reversed(active_matches):
@@ -644,25 +739,42 @@ elif mode == "スタッフ管理画面":
                         })
                     st.table(pd.DataFrame(match_rows))
 
-                    with st.expander("スタッフが代理で卓を終了して待機中に戻す（スマホ押し忘れ対応）"):
-                        match_options = {
-                            m["match_id"]: f"第{m['table']}番卓 ({m['division']}) - " + " vs ".join([data['players'].get(pid, {}).get('name', pid) for pid in m.get("players", [])])
-                            for m in active_matches
-                        }
-                        target_mid = st.selectbox("終了させる卓を選んでください", options=list(match_options.keys()), format_func=lambda x: match_options[x])
-                        target_m = next((m for m in active_matches if m["match_id"] == target_mid), None)
-                        
-                        if target_m:
-                            if st.button("この卓の対戦を終了し、メンバー全員を待機中に戻す"):
-                                target_m["status"] = "終了"
-                                for pid in target_m.get("players", []):
-                                    if pid in data["players"]:
-                                        data["players"][pid]["status"] = "待機中"
-                                        data["players"][pid]["match_count"] = data["players"][pid].get("match_count", 0) + 1
-                                save_data(data)
-                                auto_match(target_m["division"], force=False)
-                                st.success("対戦を終了し、メンバーを待機中に戻しました！")
-                                st.rerun()
+                    col_op1, col_op2 = st.columns(2)
+                    with col_op1:
+                        with st.expander("スタッフが代理で卓を終了して待機中に戻す"):
+                            match_options = {
+                                m["match_id"]: f"第{m['table']}番卓 ({m['division']}) - " + " vs ".join([data['players'].get(pid, {}).get('name', pid) for pid in m.get("players", [])])
+                                for m in active_matches
+                            }
+                            target_mid = st.selectbox("終了させる卓を選んでください", options=list(match_options.keys()), format_func=lambda x: match_options[x])
+                            target_m = next((m for m in active_matches if m["match_id"] == target_mid), None)
+                            
+                            if target_m:
+                                if st.button("この卓の対戦を終了し、メンバー全員を待機中に戻す"):
+                                    target_m["status"] = "終了"
+                                    for pid in target_m.get("players", []):
+                                        if pid in data["players"]:
+                                            data["players"][pid]["status"] = "待機中"
+                                            data["players"][pid]["match_count"] = data["players"][pid].get("match_count", 0) + 1
+                                    save_data(data)
+                                    auto_match(target_m["division"], force=False)
+                                    st.success("対戦を終了し、メンバーを待機中に戻しました！")
+                                    st.rerun()
+
+                    with col_op2:
+                        with st.expander("特定のプレイヤーを休憩中にして別マッチングを組み直す"):
+                            active_player_opts = {
+                                pid: f"{pid}: {p['name']} ({p['division']} / {p['status']})"
+                                for pid, p in data["players"].items() if p["status"] in ["対戦中", "待機中"]
+                            }
+                            if active_player_opts:
+                                break_pid = st.selectbox("休憩中に切り替えるプレイヤーを選択", options=list(active_player_opts.keys()), format_func=lambda x: active_player_opts[x], key="staff_break_pid")
+                                if st.button("この人を休憩中にし、残った人で再マッチングする"):
+                                    set_player_break_and_rematch(break_pid)
+                                    st.success("休憩中に切り替え、残りのプレイヤーで再マッチングを実行しました！")
+                                    st.rerun()
+                            else:
+                                st.write("対象のプレイヤーがいません。")
                 else:
                     st.info("現在、対戦中の卓はありません。")
 
@@ -687,7 +799,7 @@ elif mode == "スタッフ管理画面":
                             "対戦数": p.get("match_count", 0),
                             "直前の相手": ", ".join([data["players"].get(op, {}).get("name", op) for op in p.get("last_opponents", [])]),
                             "アンケート": "済" if p.get("survey_done") else "未",
-                            "参加証": "配布済" if p.get("pass_given") else "未配布"
+                            "参加賞": "配布済" if p.get("pass_given") else "未配布"
                         }
                         for pid, p in data["players"].items() if p["division"] == div
                     ]
@@ -699,10 +811,10 @@ elif mode == "スタッフ管理画面":
 
             render_live_match_board()
 
-        # 2. 参加証チェック ＆ CSV出力 ＆ イベント全体のバックアップ保存・復元タブ
+        # 2. 参加賞チェック ＆ CSV出力 ＆ イベント全体のバックアップ保存・復元タブ
         with tab_csv:
-            st.subheader("1. アンケート回答確認 ＆ 参加証の配布チェック")
-            st.write("参加者がアンケートを送信すると「アンケート回答」が自動的に **回答済** になります。参加証を渡したら右端の「参加証配布済」にチェックを入れて保存してください。")
+            st.subheader("1. アンケート回答確認 ＆ 参加賞の配布チェック")
+            st.write("参加者がアンケートを送信すると「アンケート回答」が自動的に **回答済** になります。参加賞を渡したら右端の「参加賞配布済」にチェックを入れて保存してください。")
             
             if data["players"]:
                 check_rows = []
@@ -713,7 +825,7 @@ elif mode == "スタッフ管理画面":
                         "DMPID": p.get("dmp_id", ""),
                         "現在部門": p["division"],
                         "アンケート回答": "回答済" if p.get("survey_done", False) else "未回答",
-                        "参加証配布済": p.get("pass_given", False)
+                        "参加賞配布済": p.get("pass_given", False)
                     })
                 df_check = pd.DataFrame(check_rows)
                 
@@ -725,17 +837,17 @@ elif mode == "スタッフ管理画面":
                     key="pass_editor"
                 )
                 
-                if st.button("参加証の配布チェック状態を保存する", type="primary"):
+                if st.button("参加賞の配布チェック状態を保存する", type="primary"):
                     for _, row in edited_df.iterrows():
                         pid = row["受付ID"]
                         if pid in data["players"]:
-                            data["players"][pid]["pass_given"] = bool(row["参加証配布済"])
+                            data["players"][pid]["pass_given"] = bool(row["参加賞配布済"])
                     save_data(data)
-                    st.success("参加証の配布状態を保存しました！")
+                    st.success("参加賞の配布状態を保存しました！")
                     st.rerun()
 
                 st.divider()
-                st.subheader("2. 参加者リスト（名前・DMPID・参加証状態）のCSVダウンロード")
+                st.subheader("2. 参加者リスト（名前・DMPID・参加賞状態）のCSVダウンロード")
                 player_export_list = [
                     {
                         "受付ID": pid,
@@ -744,7 +856,7 @@ elif mode == "スタッフ管理画面":
                         "現在部門": p["division"],
                         "対戦数": p.get("match_count", 0),
                         "アンケート回答": "回答済" if p.get("survey_done") else "未回答",
-                        "参加証配布": "配布済" if p.get("pass_given") else "未配布",
+                        "参加賞配布": "配布済" if p.get("pass_given") else "未配布",
                         "当選景品": " / ".join(get_winner_prizes(pid))
                     }
                     for pid, p in data["players"].items()
@@ -795,7 +907,7 @@ elif mode == "スタッフ管理画面":
                 
                 full_backup_obj = {
                     "event_name": current_event,
-                    "backup_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "backup_time": now_jst().strftime("%Y-%m-%d %H:%M:%S"),
                     "event_data": data,
                     "survey_records": survey_records
                 }
@@ -804,7 +916,7 @@ elif mode == "スタッフ管理画面":
                 st.download_button(
                     label="イベント全体のバックアップデータ（JSON）を端末に保存する",
                     data=backup_json_bytes,
-                    file_name=f"{current_event}_backup_{datetime.now().strftime('%H%M')}.json",
+                    file_name=f"{current_event}_backup_{now_jst().strftime('%H%M')}.json",
                     mime="application/json",
                     use_container_width=True,
                     type="primary"
@@ -831,7 +943,7 @@ elif mode == "スタッフ管理画面":
                         except Exception as e:
                             st.error(f"ファイルの読み込みに失敗しました。（詳細: {e}）")
 
-        # 3. 手動調整（2人・4人対応） ＆ 参加者削除
+        # 3. 手動調整（2人・4人対応） ＆ 登録者削除
         with tab_manual:
             st.subheader("手動でペアリング（2人卓 または 4人卓の作成）")
             waiting_list = {pid: f"{pid}: {p['name']} ({p['division']})" for pid, p in data["players"].items() if p["status"] == "待機中"}
@@ -857,14 +969,14 @@ elif mode == "スタッフ管理画面":
                             others = [o for o in selected_manual_pids if o != pid]
                             data["players"][pid]["opponents"].extend(others)
                             data["players"][pid]["last_opponents"] = others
-                        new_mid = f"M_MANUAL_{datetime.now().strftime('%H%M%S')}"
+                        new_mid = f"M_MANUAL_{now_jst().strftime('%H%M%S')}"
                         data["matches"].append({
                             "match_id": new_mid,
                             "division": data["players"][selected_manual_pids[0]]["division"],
                             "table": table_manual,
                             "players": selected_manual_pids,
                             "status": "対戦中",
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            "created_at": now_jst().strftime("%Y-%m-%d %H:%M:%S")
                         })
                         data["last_created_match_ids"] = [new_mid]
                         save_data(data)
@@ -874,12 +986,13 @@ elif mode == "スタッフ管理画面":
                 st.info(f"待機中のプレイヤーが{req_num}人以上いると手動ペアリングができます。")
 
             st.divider()
-            st.subheader("参加者の削除（登録ミス・途中帰宅の対応）")
+            st.subheader("登録者の削除（登録ミス・途中帰宅の対応）")
+            st.write("削除すると、その人の登録データと抽選履歴が消去されます（対戦中の場合は対戦相手が自動で待機中に戻ります）。")
             if data["players"]:
                 all_players = {pid: f"{pid}: {p['name']} [DMPID:{p.get('dmp_id', '')}] （{p['division']} / {p['status']}）" for pid, p in data["players"].items()}
-                del_pid = st.selectbox("削除するプレイヤーを選んでください", list(all_players.keys()), format_func=lambda x: all_players[x])
+                del_pid = st.selectbox("削除する登録者を選んでください", list(all_players.keys()), format_func=lambda x: all_players[x])
                 
-                if st.button("選択したプレイヤーを削除する"):
+                if st.button("選択した登録者を削除する", type="primary"):
                     for m in data["matches"]:
                         if m["status"] == "対戦中" and del_pid in m.get("players", []):
                             m["status"] = "終了"
@@ -892,7 +1005,7 @@ elif mode == "スタッフ管理画面":
                     del_name = data["players"][del_pid]["name"]
                     del data["players"][del_pid]
                     save_data(data)
-                    st.success(f"プレイヤー「{del_pid}: {del_name}」を削除しました。")
+                    st.success(f"登録者「{del_pid}: {del_name}」を削除しました。")
                     st.rerun()
             else:
                 st.info("現在登録されている参加者はいません。")
@@ -959,7 +1072,7 @@ elif mode == "スタッフ管理画面":
                     
                     actual_draw = min(len(prize_tickets), len(candidates))
                     winners = random.sample(candidates, actual_draw)
-                    now_hm = datetime.now().strftime("%H:%M:%S")
+                    now_hm = now_jst().strftime("%H:%M:%S")
                     
                     for wid, prz in zip(winners, prize_tickets[:actual_draw]):
                         data["lottery_winners"].append({
@@ -1105,32 +1218,25 @@ elif mode == "スタッフ管理画面":
                     st.error("空欄にはできません。")
 
 # ==========================================
-# プレイヤーアンケート画面
+# プレイヤーアンケート画面（登録した本人のみ固定）
 # ==========================================
 elif mode == "プレイヤーアンケート":
     st.title("イベント参加者アンケート")
     st.caption(f"対象イベント: {current_event}")
     st.write("アンケートに回答すると、参加賞の受け取りができるようになります！")
 
-    player_names = {pid: f"{pid}: {p['name']} (DMPID: {p.get('dmp_id', '未登録')})" for pid, p in data["players"].items()}
+    pinned_pid = get_pinned_pid()
 
-    if not player_names:
-        st.warning("まだイベント参加者が登録されていません。先に「プレイヤー画面」から参加登録を行ってください。")
+    if not pinned_pid:
+        st.warning("まだ参加登録が完了していません。先に左メニューの「プレイヤー画面」から参加登録を行ってください。")
     else:
-        pinned_pid = get_pinned_pid()
-        pid_list = list(player_names.keys())
-        default_idx = pid_list.index(pinned_pid) if pinned_pid in pid_list else 0
-
-        selected_survey_pid = st.selectbox(
-            "あなたのお名前（登録済みの名前が自動選択されています）",
-            options=pid_list,
-            index=default_idx,
-            format_func=lambda x: player_names[x]
-        )
+        selected_survey_pid = pinned_pid
         p_survey_info = data["players"][selected_survey_pid]
 
+        st.info(f"回答者： **{selected_survey_pid}: {p_survey_info['name']} さん** (DMPID: {p_survey_info.get('dmp_id', '未登録')})")
+
         if p_survey_info.get("survey_done"):
-            st.success(f"**{p_survey_info['name']} さん、アンケート回答済みです！**\n\nこの画面をスタッフに見せて参加賞を受け取ってください。（参加証受取状態: **{'受取済' if p_survey_info.get('pass_given') else '未受取'}**）")
+            st.success(f"**{p_survey_info['name']} さん、アンケート回答済みです！**\n\nこの画面をスタッフに見せて参加賞を受け取ってください。（参加賞受取状態: **{'受取済' if p_survey_info.get('pass_given') else '未受取'}**）")
 
         with st.form("survey_form", clear_on_submit=False):
             q_div = st.multiselect("本日遊んだ部門を教えてください", data["divisions"], default=[p_survey_info["division"]] if p_survey_info["division"] in data["divisions"] else [])
@@ -1143,7 +1249,7 @@ elif mode == "プレイヤーアンケート":
             if submitted:
                 new_row = pd.DataFrame([{
                     "イベント名": current_event,
-                    "回答日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "回答日時": now_jst().strftime("%Y-%m-%d %H:%M:%S"),
                     "受付ID": selected_survey_pid,
                     "名前": p_survey_info["name"],
                     "DMPID": p_survey_info.get("dmp_id", ""),
