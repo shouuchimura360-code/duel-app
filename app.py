@@ -211,7 +211,7 @@ def save_data(d):
 data = load_data()
 refresh_sec = data.get("refresh_sec", 60)
 
-# --- 自分の名前（ID）を記憶する機能（URL＋session_state併用で安定動作） ---
+# --- 自分の名前（ID）を記憶・固定する機能（一度登録したら変更不可） ---
 def get_pinned_pid():
     if "pinned_pid" in st.session_state and st.session_state.pinned_pid in data["players"]:
         return st.session_state.pinned_pid
@@ -225,10 +225,6 @@ def set_pinned_pid(pid):
     if pid:
         st.session_state.pinned_pid = pid
         st.query_params["pid"] = pid
-    else:
-        st.session_state.pinned_pid = None
-        if "pid" in st.query_params:
-            del st.query_params["pid"]
 
 def get_winner_prizes(pid):
     return [w.get("prize", "景品") for w in data["lottery_winners"] if w.get("pid") == pid]
@@ -384,13 +380,13 @@ def auto_match_all_divisions(force=False):
 
 auto_match_all_divisions(force=False)
 
-# --- 3. サイドバーメニュー（session_stateで安定切り替え） ---
+# --- 3. サイドバーメニュー ---
 st.sidebar.title("メニュー切り替え")
 st.sidebar.caption(f"現在開催中: **{current_event}**")
 
 pinned_pid = get_pinned_pid()
 if pinned_pid:
-    st.sidebar.info(f"固定中: **{pinned_pid}: {data['players'][pinned_pid]['name']}**")
+    st.sidebar.info(f"登録済: **{pinned_pid}: {data['players'][pinned_pid]['name']}**")
 
 if SLEEP_PREVENTED:
     st.sidebar.success("PCスリープ防止：作動中")
@@ -403,7 +399,7 @@ if st.sidebar.button("画面を最新状態に更新"):
     st.rerun()
 
 # ==========================================
-# プレイヤー画面（スマホ・PC共通）
+# プレイヤー画面（最初に登録した名前で完全固定）
 # ==========================================
 if mode == "プレイヤー画面":
     st.title("ファンイベントプレイヤー画面")
@@ -411,68 +407,48 @@ if mode == "プレイヤー画面":
 
     pinned_pid = get_pinned_pid()
 
+    # 未登録の場合：新規参加登録のみ表示
     if not pinned_pid:
-        st.subheader("1. 参加登録 または 自分の名前を画面に固定する")
-        st.write("一度登録・固定すると、次回からリストで探さなくても常にあなたの専用画面が一番上に表示されます！")
+        st.subheader("参加登録")
+        st.write("プレイヤー名・DMPID・部門を入力して「参加登録する」を押してください（登録後はあなたの専用画面に固定されます）。")
         
-        tab_new, tab_select = st.tabs(["新しくイベントに参加登録する", "登録済みの自分の名前を選んで固定する"])
+        new_name = st.text_input("あなたのプレイヤー名（ハンドルネーム）を入力")
+        new_dmp_id = st.text_input("DMPIDを入力（番号）")
+        init_div = st.selectbox("最初に参加する部門を選択", data["divisions"])
         
-        with tab_new:
-            new_name = st.text_input("あなたのプレイヤー名（ハンドルネーム）を入力")
-            new_dmp_id = st.text_input("DMPIDを入力（番号）")
-            init_div = st.selectbox("最初に参加する部門を選択", data["divisions"])
-            if st.button("イベントに参加登録して自分の画面を固定する", type="primary"):
-                if new_name:
-                    existing_nums = [int(pid[1:]) for pid in data["players"].keys() if pid[1:].isdigit()]
-                    next_num = max(existing_nums, default=0) + 1
-                    new_id = f"P{next_num:03d}"
-                    
-                    data["players"][new_id] = {
-                        "name": new_name,
-                        "dmp_id": new_dmp_id,
-                        "division": init_div,
-                        "status": "待機中",
-                        "wins": 0,
-                        "losses": 0,
-                        "match_count": 0,
-                        "opponents": [],
-                        "last_opponents": [],
-                        "survey_done": False,
-                        "pass_given": False
-                    }
-                    save_data(data)
-                    auto_match(init_div, force=False)
-                    set_pinned_pid(new_id)
-                    st.success(f"登録完了！あなたのID「{new_id} ({new_name})」をこの画面に固定しました！")
-                    st.rerun()
-                else:
-                    st.error("プレイヤー名を入力してください。")
-
-        with tab_select:
-            player_names = {pid: p["name"] for pid, p in data["players"].items()}
-            if not player_names:
-                st.info("まだ参加者がいません。左のタブから新規登録してください。")
+        if st.button("参加登録する", type="primary", use_container_width=True):
+            if new_name:
+                existing_nums = [int(pid[1:]) for pid in data["players"].keys() if pid[1:].isdigit()]
+                next_num = max(existing_nums, default=0) + 1
+                new_id = f"P{next_num:03d}"
+                
+                data["players"][new_id] = {
+                    "name": new_name,
+                    "dmp_id": new_dmp_id,
+                    "division": init_div,
+                    "status": "待機中",
+                    "wins": 0,
+                    "losses": 0,
+                    "match_count": 0,
+                    "opponents": [],
+                    "last_opponents": [],
+                    "survey_done": False,
+                    "pass_given": False
+                }
+                save_data(data)
+                auto_match(init_div, force=False)
+                set_pinned_pid(new_id)
+                st.success(f"登録完了！あなたのID「{new_id} ({new_name})」で登録しました！")
+                st.rerun()
             else:
-                select_pid = st.selectbox(
-                    "リストから自分の名前を選んでください（文字を入力すると絞り込み検索もできます）",
-                    options=list(player_names.keys()),
-                    format_func=lambda x: f"{x}: {player_names[x]} （{data['players'][x]['division']}）"
-                )
-                if st.button("この名前を自分のスマホ画面に固定する", type="primary"):
-                    set_pinned_pid(select_pid)
-                    st.rerun()
+                st.error("プレイヤー名を入力してください。")
 
+    # 登録済みの場合：最初に登録したプレイヤー専用画面を固定表示（切替ボタンなし）
     else:
         selected_pid = pinned_pid
         p_info = data["players"][selected_pid]
         
-        col_title, col_unpin = st.columns([3, 1])
-        with col_title:
-            st.success(f"**あなたの専用画面： {selected_pid} : {p_info['name']} さん**")
-        with col_unpin:
-            if st.button("別の人に切替"):
-                set_pinned_pid(None)
-                st.rerun()
+        st.success(f"**あなたの専用画面： {selected_pid} : {p_info['name']} さん**")
 
         survey_badge = "回答済" if p_info.get("survey_done") else "未回答"
         pass_badge = "受取済" if p_info.get("pass_given") else "未受取"
@@ -1146,7 +1122,7 @@ elif mode == "プレイヤーアンケート":
         default_idx = pid_list.index(pinned_pid) if pinned_pid in pid_list else 0
 
         selected_survey_pid = st.selectbox(
-            "あなたのお名前（固定中の名前が自動選択されています）",
+            "あなたのお名前（登録済みの名前が自動選択されています）",
             options=pid_list,
             index=default_idx,
             format_func=lambda x: player_names[x]
