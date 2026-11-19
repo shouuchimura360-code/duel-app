@@ -211,17 +211,22 @@ def save_data(d):
 data = load_data()
 refresh_sec = data.get("refresh_sec", 60)
 
-# --- 自分の名前（ID）や現在開いている画面をURLに記憶する機能 ---
+# --- 自分の名前（ID）を記憶する機能（URL＋session_state併用で安定動作） ---
 def get_pinned_pid():
+    if "pinned_pid" in st.session_state and st.session_state.pinned_pid in data["players"]:
+        return st.session_state.pinned_pid
     pid = st.query_params.get("pid", None)
     if pid and pid in data["players"]:
+        st.session_state.pinned_pid = pid
         return pid
     return None
 
 def set_pinned_pid(pid):
     if pid:
+        st.session_state.pinned_pid = pid
         st.query_params["pid"] = pid
     else:
+        st.session_state.pinned_pid = None
         if "pid" in st.query_params:
             del st.query_params["pid"]
 
@@ -379,7 +384,7 @@ def auto_match_all_divisions(force=False):
 
 auto_match_all_divisions(force=False)
 
-# --- 3. サイドバーメニュー ---
+# --- 3. サイドバーメニュー（session_stateで安定切り替え） ---
 st.sidebar.title("メニュー切り替え")
 st.sidebar.caption(f"現在開催中: **{current_event}**")
 
@@ -390,18 +395,8 @@ if pinned_pid:
 if SLEEP_PREVENTED:
     st.sidebar.success("PCスリープ防止：作動中")
 
-mode_list = ["プレイヤー画面", "スタッフ管理画面", "アンケート回答"]
-mode_codes = {"player": 0, "admin": 1, "survey": 2}
-code_by_mode = {"プレイヤー画面": "player", "スタッフ管理画面": "admin", "アンケート回答": "survey"}
-
-current_mode_code = st.query_params.get("mode", "player")
-default_mode_idx = mode_codes.get(current_mode_code, 0)
-
-mode = st.sidebar.radio("画面を選んでください", mode_list, index=default_mode_idx)
-
-selected_code = code_by_mode[mode]
-if st.query_params.get("mode") != selected_code:
-    st.query_params["mode"] = selected_code
+mode_list = ["プレイヤー画面", "スタッフ管理画面", "プレイヤーアンケート"]
+mode = st.sidebar.radio("画面を選んでください", mode_list, key="nav_mode")
 
 st.sidebar.divider()
 if st.sidebar.button("画面を最新状態に更新"):
@@ -585,7 +580,7 @@ elif mode == "スタッフ管理画面":
     st.title("イベント運営・スタッフ管理画面")
 
     if "is_admin" not in st.session_state:
-        st.session_state.is_admin = (st.query_params.get("auth") == "1")
+        st.session_state.is_admin = False
 
     if not st.session_state.is_admin:
         st.warning("この画面はスタッフ専用です。操作するにはパスワードを入力してください。")
@@ -593,8 +588,6 @@ elif mode == "スタッフ管理画面":
         if st.button("ログイン", type="primary"):
             if pwd_input == config.get("admin_password", "1234"):
                 st.session_state.is_admin = True
-                st.query_params["mode"] = "admin"
-                st.query_params["auth"] = "1"
                 st.success("認証に成功しました！")
                 st.rerun()
             else:
@@ -602,8 +595,6 @@ elif mode == "スタッフ管理画面":
     else:
         if st.sidebar.button("スタッフ画面をロック（ログアウト）"):
             st.session_state.is_admin = False
-            if "auth" in st.query_params:
-                del st.query_params["auth"]
             st.rerun()
 
         tab_status, tab_csv, tab_manual, tab_lottery, tab_qr, tab_settings = st.tabs([
@@ -1138,7 +1129,7 @@ elif mode == "スタッフ管理画面":
                     st.error("空欄にはできません。")
 
 # ==========================================
-# アンケート回答画面
+# プレイヤーアンケート画面
 # ==========================================
 elif mode == "プレイヤーアンケート":
     st.title("イベント参加者アンケート")
